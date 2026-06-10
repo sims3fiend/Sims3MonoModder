@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Win32">
+      <Configuration>Debug</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Win32">
+      <Configuration>Release</Configuration>
+      <Platform>Win32</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{A1B2C3D4-E5F6-7890-ABCD-EF1234567890}</ProjectGuid>
+    <RootNamespace>Sims3MonoModder</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+    <ProjectName>Sims3MonoModder</ProjectName>
+    <VcpkgTriplet>x86-windows-static</VcpkgTriplet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="Shared">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <TargetExt>.asi</TargetExt>
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <TargetExt>.asi</TargetExt>
+    <OutDir>$(ProjectDir)bin\$(Configuration)\</OutDir>
+    <IntDir>$(ProjectDir)obj\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;_DEBUG;S3MM_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <Optimization>Disabled</Optimization>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <AdditionalDependencies>imgui.lib;detours.lib;d3d9.lib;dxguid.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)src\resources;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <PreBuildEvent>
+      <Command>cd /d "$(ProjectDir)S3MM.Helper" &amp;&amp; call "$(ProjectDir)S3MM.Helper\build.bat"</Command>
+      <Message>Building S3MM.Helper.dll from S3MM.cs</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>WIN32;NDEBUG;S3MM_EXPORTS;_WINDOWS;_USRDLL;%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <EnableUAC>false</EnableUAC>
+      <AdditionalDependencies>imgui.lib;detours.lib;d3d9.lib;dxguid.lib;psapi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(ProjectDir)vcpkg_installed\$(VcpkgTriplet)\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+    </Link>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)src\resources;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <PreBuildEvent>
+      <Command>cd /d "$(ProjectDir)S3MM.Helper" &amp;&amp; call "$(ProjectDir)S3MM.Helper\build.bat"</Command>
+      <Message>Building S3MM.Helper.dll from S3MM.cs</Message>
+    </PreBuildEvent>
+  </ItemDefinitionGroup>
+  <!-- Header Files -->
+  <ItemGroup>
+    <ClInclude Include="src\core\addresses.h" />
+    <ClInclude Include="src\core\mono_types.h" />
+    <ClInclude Include="src\core\mono_bridge.h" />
+    <ClInclude Include="src\core\mono_class.h" />
+    <ClInclude Include="src\core\mono_profiler.h" />
+    <ClInclude Include="src\core\script_host_hook.h" />
+    <ClInclude Include="src\core\exception_hook.h" />
+    <ClInclude Include="src\core\exception_helper.h" />
+    <ClInclude Include="src\util\logger.h" />
+    <ClInclude Include="src\util\memory.h" />
+    <ClInclude Include="src\util\config.h" />
+    <ClInclude Include="src\util\config_paths.h" />
+    <ClInclude Include="src\util\mod_log.h" />
+    <ClInclude Include="src\resources\resource.h" />
+    <ClInclude Include="src\ui\imgui_manager.h" />
+    <ClInclude Include="src\ui\main_window.h" />
+    <ClInclude Include="src\ui\class_browser_panel.h" />
+    <ClInclude Include="src\ui\method_panel.h" />
+    <ClInclude Include="src\ui\field_panel.h" />
+    <ClInclude Include="src\ui\property_panel.h" />
+    <ClInclude Include="src\ui\singleton_panel.h" />
+    <ClInclude Include="src\ui\settings_panel.h" />
+    <ClInclude Include="src\ui\object_explorer_panel.h" />
+    <ClInclude Include="src\ui\profiler_panel.h" />
+    <ClInclude Include="src\ui\heap_browser_panel.h" />
+    <ClInclude Include="src\ui\mods_panel.h" />
+    <ClInclude Include="src\ui\themes.h" />
+    <ClInclude Include="src\modding\mod_manager.h" />
+    <ClInclude Include="src\modding\mod_loader.h" />
+    <ClInclude Include="src\modding\mod_compiler.h" />
+    <ClInclude Include="src\modding\method_patcher.h" />
+    <ClInclude Include="src\modding\hook_manager.h" />
+    <ClInclude Include="src\core\assembly_hooks.h" />
+    <ClInclude Include="src\modding\package_reader.h" />
+    <ClInclude Include="src\core\il_parser.h" />
+    <ClInclude Include="src\core\il_xref.h" />
+    <ClInclude Include="src\modding\conflict_detector.h" />
+    <ClInclude Include="src\core\vanilla_extractor.h" />
+    <ClInclude Include="src\modding\assembly_diff.h" />
+    <ClInclude Include="src\modding\audit_api.h" />
+    <ClInclude Include="src\ui\xref_panel.h" />
+    <ClInclude Include="src\ui\list_helpers.h" />
+    <ClInclude Include="src\ui\field_rendering.h" />
+    <ClInclude Include="src\ui\inspector_panel.h" />
+    <ClInclude Include="src\cache\mono_cache.h" />
+    <ClInclude Include="src\cache\cache_api.h" />
+    <ClInclude Include="src\core\resource_system.h" />
+    <ClInclude Include="src\ui\resource_browser_panel.h" />
+  </ItemGroup>
+  <!-- Source Files -->
+  <ItemGroup>
+    <ClCompile Include="src\core\addresses.cpp" />
+    <ClCompile Include="src\util\memory.cpp" />
+    <ClCompile Include="src\dllmain.cpp" />
+    <ClCompile Include="src\core\mono_bridge.cpp" />
+    <ClCompile Include="src\core\mono_class.cpp" />
+    <ClCompile Include="src\core\mono_profiler.cpp" />
+    <ClCompile Include="src\core\script_host_hook.cpp" />
+    <ClCompile Include="src\core\exception_hook.cpp" />
+    <ClCompile Include="src\util\config.cpp" />
+    <ClCompile Include="src\util\config_paths.cpp" />
+    <ClCompile Include="src\ui\imgui_manager.cpp" />
+    <ClCompile Include="src\ui\main_window.cpp" />
+    <ClCompile Include="src\ui\class_browser_panel.cpp" />
+    <ClCompile Include="src\ui\method_panel.cpp" />
+    <ClCompile Include="src\ui\field_panel.cpp" />
+    <ClCompile Include="src\ui\property_panel.cpp" />
+    <ClCompile Include="src\ui\singleton_panel.cpp" />
+    <ClCompile Include="src\ui\settings_panel.cpp" />
+    <ClCompile Include="src\ui\object_explorer_panel.cpp" />
+    <ClCompile Include="src\ui\profiler_panel.cpp" />
+    <ClCompile Include="src\ui\heap_browser_panel.cpp" />
+    <ClCompile Include="src\ui\mods_panel.cpp" />
+    <ClCompile Include="src\ui\themes.cpp" />
+    <ClCompile Include="src\modding\mod_manager.cpp" />
+    <ClCompile Include="src\modding\mod_loader.cpp" />
+    <ClCompile Include="src\modding\mod_compiler.cpp" />
+    <ClCompile Include="src\modding\method_patcher.cpp" />
+    <ClCompile Include="src\modding\hook_manager.cpp" />
+    <ClCompile Include="src\core\assembly_hooks.cpp" />
+    <ClCompile Include="src\modding\package_reader.cpp" />
+    <ClCompile Include="src\core\il_parser.cpp" />
+    <ClCompile Include="src\core\il_xref.cpp" />
+    <ClCompile Include="src\modding\conflict_detector.cpp" />
+    <ClCompile Include="src\core\vanilla_extractor.cpp" />
+    <ClCompile Include="src\modding\assembly_diff.cpp" />
+    <ClCompile Include="src\modding\audit_api.cpp" />
+    <ClCompile Include="src\ui\xref_panel.cpp" />
+    <ClCompile Include="src\ui\list_helpers.cpp" />
+    <ClCompile Include="src\ui\field_rendering.cpp" />
+    <ClCompile Include="src\ui\inspector_panel.cpp" />
+    <ClCompile Include="src\cache\mono_cache.cpp" />
+    <ClCompile Include="src\cache\cache_api.cpp" />
+    <ClCompile Include="src\core\resource_system.cpp" />
+    <ClCompile Include="src\ui\resource_browser_panel.cpp" />
+  </ItemGroup>
+  <!-- Resources -->
+  <ItemGroup>
+    <ResourceCompile Include="src\resources\resources.rc" />
+    <None Include="src\resources\themes.toml" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

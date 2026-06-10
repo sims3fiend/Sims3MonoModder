@@ -1,0 +1,335 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <Filter Include="Source Files">
+      <UniqueIdentifier>{4FC737F1-C7A5-4376-A066-2A32D752A2FF}</UniqueIdentifier>
+      <Extensions>cpp;c;cc;cxx;c++;cppm;ixx;def;odl;idl;hpj;bat;asm;asmx</Extensions>
+    </Filter>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{93995380-89BD-4b04-88EB-625FBE52EBFB}</UniqueIdentifier>
+      <Extensions>h;hh;hpp;hxx;h++;hm;inl;inc;ipp;xsd</Extensions>
+    </Filter>
+    <Filter Include="Resource Files">
+      <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
+      <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms;toml</Extensions>
+    </Filter>
+    <Filter Include="Source Files\cache">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567899}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\core">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567891}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\modding">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567897}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\ui">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567892}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\util">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567893}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\cache">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF123456789A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\core">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567894}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\modding">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567898}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\ui">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567895}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\util">
+      <UniqueIdentifier>{D1B2C3D4-E5F6-7890-ABCD-EF1234567896}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="src\cache\cache_api.h">
+      <Filter>Header Files\cache</Filter>
+    </ClInclude>
+    <ClInclude Include="src\cache\mono_cache.h">
+      <Filter>Header Files\cache</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\addresses.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\assembly_hooks.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\exception_helper.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\exception_hook.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\il_parser.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\il_xref.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\mono_bridge.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\mono_class.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\mono_profiler.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\mono_types.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\resource_system.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\script_host_hook.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\core\vanilla_extractor.h">
+      <Filter>Header Files\core</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\assembly_diff.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\audit_api.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\conflict_detector.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\hook_manager.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\method_patcher.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\mod_compiler.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\mod_loader.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\mod_manager.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\modding\package_reader.h">
+      <Filter>Header Files\modding</Filter>
+    </ClInclude>
+    <ClInclude Include="src\resources\resource.h">
+      <Filter>Resource Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\class_browser_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\field_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\field_rendering.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\heap_browser_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\imgui_manager.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\inspector_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\list_helpers.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\main_window.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\method_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\mods_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\object_explorer_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\profiler_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\property_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\resource_browser_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\settings_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\singleton_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\themes.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\ui\xref_panel.h">
+      <Filter>Header Files\ui</Filter>
+    </ClInclude>
+    <ClInclude Include="src\util\config.h">
+      <Filter>Header Files\util</Filter>
+    </ClInclude>
+    <ClInclude Include="src\util\config_paths.h">
+      <Filter>Header Files\util</Filter>
+    </ClInclude>
+    <ClInclude Include="src\util\logger.h">
+      <Filter>Header Files\util</Filter>
+    </ClInclude>
+    <ClInclude Include="src\util\memory.h">
+      <Filter>Header Files\util</Filter>
+    </ClInclude>
+    <ClInclude Include="src\util\mod_log.h">
+      <Filter>Header Files\util</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\dllmain.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\cache\cache_api.cpp">
+      <Filter>Source Files\cache</Filter>
+    </ClCompile>
+    <ClCompile Include="src\cache\mono_cache.cpp">
+      <Filter>Source Files\cache</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\addresses.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\assembly_hooks.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\exception_hook.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\il_parser.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\il_xref.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\mono_bridge.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\mono_class.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\mono_profiler.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\resource_system.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\script_host_hook.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\core\vanilla_extractor.cpp">
+      <Filter>Source Files\core</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\assembly_diff.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\audit_api.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\conflict_detector.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\hook_manager.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\method_patcher.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\mod_compiler.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\mod_loader.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\mod_manager.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\modding\package_reader.cpp">
+      <Filter>Source Files\modding</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\class_browser_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\field_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\field_rendering.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\heap_browser_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\imgui_manager.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\inspector_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\list_helpers.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\main_window.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\method_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\mods_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\object_explorer_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\profiler_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\property_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\resource_browser_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\settings_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\singleton_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\themes.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\ui\xref_panel.cpp">
+      <Filter>Source Files\ui</Filter>
+    </ClCompile>
+    <ClCompile Include="src\util\config.cpp">
+      <Filter>Source Files\util</Filter>
+    </ClCompile>
+    <ClCompile Include="src\util\config_paths.cpp">
+      <Filter>Source Files\util</Filter>
+    </ClCompile>
+    <ClCompile Include="src\util\memory.cpp">
+      <Filter>Source Files\util</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\resources\resources.rc">
+      <Filter>Resource Files</Filter>
+    </ResourceCompile>
+    <None Include="src\resources\themes.toml">
+      <Filter>Resource Files</Filter>
+    </None>
+  </ItemGroup>
+</Project>

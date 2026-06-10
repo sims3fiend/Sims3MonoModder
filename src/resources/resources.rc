@@ -1,0 +1,7 @@
+#include "resource.h"
+
+// Embed themes.toml as raw data
+IDR_THEMES_TOML RCDATA "themes.toml"
+
+// Embed S3MM.Helper.dll so users don't need it as a separate file
+IDR_S3MM_HELPER RCDATA "..\\..\\S3MM.Helper\\S3MM.Helper.dll"
