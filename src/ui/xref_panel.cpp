@@ -149,6 +149,20 @@ const char* XRefPanel::GetOpcodeName(uint8_t opcode) {
     }
 }
 
+// Field opcodes (ldfld/stfld/etc.) target a field, calli has no method token, and MemberRef/MethodSpec targets resolve to a bare name (owner discarded) those are filtered separately by requiring "::" in the resolved targetName.
+static bool IsNavigableCalleeOpcode(uint8_t opcode) {
+    switch (opcode) {
+    case 0x28: // call
+    case 0x6F: // callvirt
+    case 0x73: // newobj
+    case 0x06: // ldftn (FE 06)
+    case 0x07: // ldvirtftn (FE 07)
+        return true;
+    default:
+        return false;
+    }
+}
+
 void XRefPanel::RenderScanningIndicator() {
     auto elapsed = std::chrono::steady_clock::now() - m_scanStartTime;
     auto elapsedSec = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
@@ -308,10 +322,20 @@ void XRefPanel::RenderResults() {
                 color = xc.neutral; // Amber for field access
             }
 
+            // Navigable only for method-call opcodes whose target resolved to a MethodDef ("Namespace.Class::Method")
+            // Bare names (cross-assembly MemberRef) and field accesses are left non-navigable.
+            size_t colonPos = entry.targetName.find("::");
+            bool navigable = IsNavigableCalleeOpcode(entry.opcode) && colonPos != std::string::npos;
+
             ImGui::PushStyleColor(ImGuiCol_Text, color);
             if (ImGui::Selectable(label)) {
-                // TODO: Navigate to target method if it's in the same assembly
-                LOG_INFO("[XRefPanel] Selected: " + entry.targetName);
+                if (navigable) {
+                    std::string fullClassName = entry.targetName.substr(0, colonPos);
+                    std::string targetMethod = entry.targetName.substr(colonPos + 2);
+                    MainWindow::Get().NavigateToHook(fullClassName, targetMethod);
+                } else {
+                    LOG_INFO("[XRefPanel] Target not navigable (external ref or field): " + entry.targetName);
+                }
             }
             ImGui::PopStyleColor();
 
@@ -327,7 +351,11 @@ void XRefPanel::RenderResults() {
                 ImGui::Text("Target: %s", entry.targetName.c_str());
                 ImGui::Text("IL Offset: 0x%X", entry.ilOffset);
                 ImGui::Text("Opcode: %s (0x%02X)", GetOpcodeName(entry.opcode), entry.opcode);
-                ImGui::TextDisabled("Right-click for options");
+                if (navigable) {
+                    ImGui::TextDisabled("Click to navigate, right-click for options");
+                } else {
+                    ImGui::TextDisabled("External ref or field - right-click for options");
+                }
                 ImGui::EndTooltip();
             }
         }
