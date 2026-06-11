@@ -3,12 +3,6 @@ using System.Runtime.CompilerServices;
 
 namespace S3MM
 {
-    // Mono 1.2.3.1 footgun (affects ALL mods): delegates passed to native APIs that marshal
-    // them as COM CCWs (CommandSystem.RegisterCommand, anything [MarshalAs(UnmanagedType.Interface)])
-    // must be rooted mod-side in a static/instance field, or the GC collects them and the next
-    // native invoke crashes ("object.c:2150, condition `im' not met"). See examples/README.md
-    // "Delegate lifetime" for the why and the fix.
-
     /// <summary>
     /// Current S3MM API version. Incremented only when the managed API shape changes (added/removed/renamed ICALLs, changed signatures, attribute semantics).
     /// Internal native changes that don't affect the managed surface do not bump this.
