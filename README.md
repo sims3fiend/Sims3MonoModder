@@ -1,7 +1,9 @@
-# Sims3MonoModder (S3MM)
+# Sims3MonoModder (S3MM) BETA
 
-> **Warning!!! Alpha!!!**
-> Everything here is still a work in progress. The managed API surface in [`S3MM.Helper/S3MM.cs`](S3MM.Helper/S3MM.cs) should be stable enough to build with, but parts of it may be broken in ways I haven't discovered yet. This release is intended at developers, not at users.
+> **Warning!!! Beta!!!**
+> Everything here is still a work in progress. The managed API surface in [`S3MM.Helper/S3MM.cs`](S3MM.Helper/S3MM.cs) should be stable enough to build with (hopefully only additions), but parts of it may be broken in ways I haven't discovered yet. This release is intended at developers, not at users.
+
+Contact me on [Tumblr](https://sims3fiend.tumblr.com/) | [Discord](https://discord.com/users/239640351999000578)
 
 ## Features
 
@@ -23,7 +25,7 @@
 - **Resource Browser** browse loaded packages and extract their contents in-game (WIP, will be expanded)
 - **Settings / Themes** cool colors.
 
-> *(screenshot here)*
+<img width="1350" height="902" alt="image" src="https://github.com/user-attachments/assets/64620205-de85-4db9-897c-ab890272540a" />
 
 ## Installation
 
@@ -54,20 +56,20 @@ cmake --build --preset x86-release
 Alternatively open `Sims3MonoModder.vcxproj` directly in Visual Studio and build `Release|Win32` (run `vcpkg install --triplet x86-windows-static` in the repo root first so `vcpkg_installed\` exists).
 
 ## Roadmap
-- In-mod ImGui API, let mods register their own overlay panels, notifications, etc.
+- In-mod ImGui API, let mods register their own overlay panels, notifications, etc. Currently being worked on but a bigger task than I thought...
 - Resource Browser expansion, resource loading to replace `.package` as a requirement entirely, as well as XML tweaking in-script/dynamically through MM
-- Proper getting-started guide + worked examples beyond the demo scripts
-- Clean up logging/remove old logging
-- Add more helper functions, including native-side stuff
+- Proper getting-started guide + working examples beyond the demo scripts (and actual mods)
+- Add more helper functions, including native-side access stuff
 - Rewrite the readme to be less bad
 
 ## License
 
-[GPLv3](LICENSE). Statically links [Microsoft Detours](https://github.com/microsoft/Detours), [Dear ImGui](https://github.com/ocornut/imgui), and [toml++](https://github.com/marzer/tomlplusplus)
+[GPLv3](LICENSE).
+Also uses [Microsoft Detours](https://github.com/microsoft/Detours), [Dear ImGui](https://github.com/ocornut/imgui), and [toml++](https://github.com/marzer/tomlplusplus)
 
 ## Credits
-- [S3PI](https://s3pi.sourceforge.net/): the S3SA decryption in the package reader is ported from it
-- LazyDuchess for [MonoPatcher](https://github.com/LazyDuchess/MonoPatcher) and for many many many other projects and ideas that I've ~~stolen~~ adopted over the year(s)...
+- LazyDuchess for [MonoPatcher](https://github.com/LazyDuchess/MonoPatcher) and for many many many other projects and ideas that I've ~~stolen~~... adopted over the years...
 - Everyone on LazyDuchess' discord for support, motivation, ideas, etc. etc. etc.
-- @Just-harry in particular for help, ideas, input, etc.
+- [Just-harry](https://github.com/just-harry) in particular for help, ideas, input, etc.
+- [S3PI](https://s3pi.sourceforge.net/): the S3SA decryption in the package reader is ported from it
 - Probably many other people 
