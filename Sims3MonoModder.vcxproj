@@ -149,6 +149,8 @@
     <ClInclude Include="src\modding\mod_compiler.h" />
     <ClInclude Include="src\modding\method_patcher.h" />
     <ClInclude Include="src\modding\hook_manager.h" />
+    <ClInclude Include="src\modding\chain_compiler.h" />
+    <ClInclude Include="src\modding\mint_verifier.h" />
     <ClInclude Include="src\core\assembly_hooks.h" />
     <ClInclude Include="src\modding\package_reader.h" />
     <ClInclude Include="src\core\il_parser.h" />
@@ -196,6 +198,8 @@
     <ClCompile Include="src\modding\mod_compiler.cpp" />
     <ClCompile Include="src\modding\method_patcher.cpp" />
     <ClCompile Include="src\modding\hook_manager.cpp" />
+    <ClCompile Include="src\modding\chain_compiler.cpp" />
+    <ClCompile Include="src\modding\mint_verifier.cpp" />
     <ClCompile Include="src\core\assembly_hooks.cpp" />
     <ClCompile Include="src\modding\package_reader.cpp" />
     <ClCompile Include="src\core\il_parser.cpp" />

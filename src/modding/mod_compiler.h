@@ -20,7 +20,7 @@ struct ModInfo {
 class ModCompiler {
   public:
     // Bump ONLY when managed API shape changes (added/removed/renamed ICALLs, changed signatures, attribute semantics)
-    static constexpr int API_VERSION = 1;
+    static constexpr int API_VERSION = 2;
 
     static ModCompiler& Get();
 

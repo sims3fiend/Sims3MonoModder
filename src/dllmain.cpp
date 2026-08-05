@@ -11,6 +11,7 @@
 #include "core/script_host_hook.h"
 #include "core/exception_hook.h"
 #include "cache/mono_cache.h"
+#include "modding/chain_compiler.h"
 #include "modding/mod_manager.h"
 #include "ui/imgui_manager.h"
 #include "ui/main_window.h"
@@ -31,11 +32,19 @@ static void OnMonoRuntimeReady() {
     }
     LOG_INFO("MonoBridge initialized");
 
+    // CO-RESIDENT MODULE SNAPSHOT - record the other native mod binaries sharing the process (ASIs, proxy DLLs).
+    // Attribution only, no probing: the VEH crash path resolves fault addresses against this snapshot so a conflict crash names the real culprit instead of blaming MM.
+    Memory::SnapshotModules();
+    Memory::LogCoResidentModules();
+
     // Install global exception hook (mono_raise_exception) that logs all managed exceptions with source assembly attribution; requires Addresses.
     if (!ExceptionHook::Get().Initialize()) { LOG_WARN("Failed to install exception hook - exception logging unavailable"); }
 
     // Install native Mono lookup cache (detour hooks on 6 lookup functions); requires Addresses and MonoBridge, and stored function pointers route through hooks.
     MonoLookupCache::Get().Install();
+
+    // Install the chain-compiler instrument (detour on SPEC_interp_add_data_item) used to locate CallNext data_items slots during hook link transforms
+    ChainCompiler::Get().Install();
 
     // Load and patch mods
     ModManager::Get().ProcessMods();

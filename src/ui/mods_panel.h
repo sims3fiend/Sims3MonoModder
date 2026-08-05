@@ -7,6 +7,7 @@
 #include <vector>
 #include <set>
 #include <map>
+#include <utility>
 
 namespace S3MM {
 

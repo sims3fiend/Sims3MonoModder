@@ -23,6 +23,7 @@ int32_t AuditAPI::s_hiTargetOff = 0;
 int32_t AuditAPI::s_hiModNameOff = 0;
 int32_t AuditAPI::s_hiPriorityOff = 0;
 int32_t AuditAPI::s_hiIsWatcherOff = 0;
+int32_t AuditAPI::s_hiIsEntryOff = 0;
 
 void* AuditAPI::s_replacedAsmKlass = nullptr;
 int32_t AuditAPI::s_replacedAsmElemSize = 0;
@@ -83,14 +84,15 @@ bool AuditAPI::InitManagedTypes() {
     s_hiModNameOff = resolveFieldOffset(s_hookInfoKlass, "ModName");
     s_hiPriorityOff = resolveFieldOffset(s_hookInfoKlass, "Priority");
     s_hiIsWatcherOff = resolveFieldOffset(s_hookInfoKlass, "IsWatcher");
+    s_hiIsEntryOff = resolveFieldOffset(s_hookInfoKlass, "IsEntry");
 
-    if (s_hiTargetOff < 0 || s_hiModNameOff < 0 || s_hiPriorityOff < 0 || s_hiIsWatcherOff < 0) {
+    if (s_hiTargetOff < 0 || s_hiModNameOff < 0 || s_hiPriorityOff < 0 || s_hiIsWatcherOff < 0 || s_hiIsEntryOff < 0) {
         LOG_ERROR("[AuditAPI] HookInfo field resolution failed");
         return false;
     }
 
     LOG_DEBUG("[AuditAPI] HookInfo resolved: elemSize=" + std::to_string(s_hookInfoElemSize) + " Target@" + std::to_string(s_hiTargetOff) + " ModName@" + std::to_string(s_hiModNameOff) + " Priority@" +
-              std::to_string(s_hiPriorityOff) + " IsWatcher@" + std::to_string(s_hiIsWatcherOff));
+              std::to_string(s_hiPriorityOff) + " IsWatcher@" + std::to_string(s_hiIsWatcherOff) + " IsEntry@" + std::to_string(s_hiIsEntryOff));
 
     // Resolve ReplacedAssembly
     s_replacedAsmKlass = bridge.GetClassFromNameInImage(s3mmImage, "S3MM", "ReplacedAssembly");
@@ -118,7 +120,7 @@ bool AuditAPI::InitManagedTypes() {
 }
 
 // WRITE HOOKINFO - Write a HookInfo element into a value type array
-void AuditAPI::WriteHookInfo(void* array, int32_t index, void* targetStr, const char* modName, int32_t priority, bool isWatcher) {
+void AuditAPI::WriteHookInfo(void* array, int32_t index, void* targetStr, const char* modName, int32_t priority, bool isWatcher, bool isEntry) {
     auto& bridge = MonoBridge::Get();
     char* elem = (char*)bridge.GetArrayElementPtr(array, index, s_hookInfoElemSize);
     if (!elem) return;
@@ -133,6 +135,8 @@ void AuditAPI::WriteHookInfo(void* array, int32_t index, void* targetStr, const 
     // Bool in Mono sequential struct: 1 byte at the field offset. Zero the full int32 first to clear padding, then write the byte.
     *(int32_t*)(elem + s_hiIsWatcherOff) = 0;
     *(uint8_t*)(elem + s_hiIsWatcherOff) = isWatcher ? 1 : 0;
+    *(int32_t*)(elem + s_hiIsEntryOff) = 0;
+    *(uint8_t*)(elem + s_hiIsEntryOff) = isEntry ? 1 : 0;
 }
 
 // INDEX MANAGEMENT - Rebuild class:method lookup index
@@ -143,6 +147,8 @@ void AuditAPI::RebuildClassMethodIndex() {
     s_classMethodIndex.clear();
     s_classMethodIndex.reserve(chains.size());
     for (const auto& [methodPtr, chain] : chains) {
+        // A chain with no live entries is not "hooked" e.g. one whose only hooks were rejected (ineligible typed) or removed on hot-reload. Indexing it would mis-report IsMethodHooked.
+        if (chain.hooks.empty() && chain.watchers.empty()) continue;
         std::string key = chain.targetClass + ":" + chain.targetMethod;
         s_classMethodIndex[key] = true;
     }
@@ -168,9 +174,49 @@ int32_t __cdecl AuditAPI::NativeIsAssemblyReplaced(void* assemblyNameStr) {
     return IsCoreAssemblyReplaced(name.c_str()) ? 1 : 0;
 }
 
+// Did "Class:Method" install on the zero-overhead baked chain? Source is HookChain.bakedActive (set in TryInstallBakedChain, cleared when a baked chain empties)
+// A method on the boxing path - or a typed hook that was rejected and stripped - reports 0 here while IsMethodHooked may still report 1/0.
+int32_t __cdecl AuditAPI::NativeIsMethodBaked(void* classMethodStr) {
+    if (!classMethodStr) return 0;
+    std::string classMethod = MonoBridge::Get().ExtractString(classMethodStr);
+    if (classMethod.empty()) return 0;
+
+    // Parse "Class:Method" (same split as NativeGetHookChain).
+    size_t colonPos = classMethod.rfind(':');
+    if (colonPos == std::string::npos || colonPos == 0) return 0;
+
+    std::string targetClass = classMethod.substr(0, colonPos);
+    std::string targetMethod = classMethod.substr(colonPos + 1);
+
+    HookChain* chain = HookManager::Get().GetChainByName(targetClass, targetMethod);
+    return (chain && chain->bakedActive) ? 1 : 0;
+}
+
+// Why did a typed hook here fail to bake? Source is HookChain.bakeRejectReason (set in DemoteIneligibleTypedHooks, cleared on a clean bake). null = baked / no typed hooks / not hooked
+void* __cdecl AuditAPI::NativeGetBakeRejectReason(void* classMethodStr) {
+    if (!classMethodStr) return nullptr;
+    std::string classMethod = MonoBridge::Get().ExtractString(classMethodStr);
+    if (classMethod.empty()) return nullptr;
+
+    size_t colonPos = classMethod.rfind(':');
+    if (colonPos == std::string::npos || colonPos == 0) return nullptr;
+
+    std::string targetClass = classMethod.substr(0, colonPos);
+    std::string targetMethod = classMethod.substr(colonPos + 1);
+
+    HookChain* chain = HookManager::Get().GetChainByName(targetClass, targetMethod);
+    if (!chain || chain->bakeRejectReason.empty()) return nullptr;
+    return MonoBridge::Get().CreateString(chain->bakeRejectReason.c_str());
+}
+
 // TIER 2 - Bulk queries returning typed managed arrays
+// Count only chains with LIVE entries - matches RebuildClassMethodIndex / IsMethodHooked, which skip chains emptied by rejection (ineligible typed) or hot-reload removal. Counting raw m_chains would over-report.
 int32_t __cdecl AuditAPI::NativeGetHookedMethodCount() {
-    return static_cast<int32_t>(HookManager::Get().GetAllChains().size());
+    int32_t count = 0;
+    for (const auto& [methodPtr, chain] : HookManager::Get().GetAllChains()) {
+        if (!chain.hooks.empty() || !chain.watchers.empty()) ++count;
+    }
+    return count;
 }
 
 void* __cdecl AuditAPI::NativeGetAllHooks() {
@@ -197,8 +243,8 @@ void* __cdecl AuditAPI::NativeGetAllHooks() {
         std::string target = chain.targetClass + ":" + chain.targetMethod;
         void* targetStr = bridge.CreateString(target.c_str());
 
-        for (const auto& w : chain.watchers) { WriteHookInfo(array, idx++, targetStr, w.modName.c_str(), w.priority, true); }
-        for (const auto& h : chain.hooks) { WriteHookInfo(array, idx++, targetStr, h.modName.c_str(), h.priority, false); }
+        for (const auto& w : chain.watchers) { WriteHookInfo(array, idx++, targetStr, w.modName.c_str(), w.priority, true, false); }
+        for (const auto& h : chain.hooks) { WriteHookInfo(array, idx++, targetStr, h.modName.c_str(), h.priority, false, &h == &chain.hooks.front()); }
     }
 
     return array;
@@ -231,8 +277,8 @@ void* __cdecl AuditAPI::NativeGetHookChain(void* classMethodStr) {
     void* targetStr = bridge.CreateString(classMethod.c_str());
 
     int32_t idx = 0;
-    for (const auto& w : chain->watchers) { WriteHookInfo(array, idx++, targetStr, w.modName.c_str(), w.priority, true); }
-    for (const auto& h : chain->hooks) { WriteHookInfo(array, idx++, targetStr, h.modName.c_str(), h.priority, false); }
+    for (const auto& w : chain->watchers) { WriteHookInfo(array, idx++, targetStr, w.modName.c_str(), w.priority, true, false); }
+    for (const auto& h : chain->hooks) { WriteHookInfo(array, idx++, targetStr, h.modName.c_str(), h.priority, false, &h == &chain->hooks.front()); }
 
     return array;
 }

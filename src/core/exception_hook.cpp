@@ -3,6 +3,7 @@
 #include "mono_bridge.h"
 #include "mono_types.h"
 #include "../modding/hook_manager.h"
+#include "../util/memory.h"
 #include "../util/logger.h"
 #include "../util/mod_log.h"
 #include "exception_helper.h"
@@ -20,6 +21,19 @@ ExceptionHook::interp_ex_handler_t ExceptionHook::s_originalInterpExHandler = nu
 ExceptionHook::g_error_t ExceptionHook::s_originalGError = nullptr;
 PVOID ExceptionHook::s_vehHandle = nullptr;
 volatile LONG ExceptionHook::s_inVehHandler = 0;
+bool ExceptionHook::s_interpRecoveryEnabled = true;
+
+// SIGNATURE GUARD - verify the recovery site still holds the instructions the VEH rewind assumes: MOV ECX,[EAX] (8B 08) at +CRASH_OFFSET and TEST EAX,EAX (85 C0) at +REWIND_OFFSET
+// Read-only and IsReadablePointer-guarded, so a bad base can't fault the probe
+bool ExceptionHook::InterpRecoverySignatureIntact(uintptr_t execStateAddr) {
+    if (!execStateAddr) return false;
+
+    const uint8_t* crash = reinterpret_cast<const uint8_t*>(execStateAddr + INTERP_CRASH_OFFSET);
+    const uint8_t* rewind = reinterpret_cast<const uint8_t*>(execStateAddr + INTERP_REWIND_OFFSET);
+    if (!IsReadablePointer((void*)crash, 2) || !IsReadablePointer((void*)rewind, 2)) return false;
+
+    return crash[0] == 0x8B && crash[1] == 0x08 && rewind[0] == 0x85 && rewind[1] == 0xC0;
+}
 
 // SINGLETON - Meyer's singleton accessor
 ExceptionHook& ExceptionHook::Get() {
@@ -88,6 +102,16 @@ bool ExceptionHook::Initialize() {
     if (error != NO_ERROR) {
         LOG_ERROR("[ExceptionHook] DetourTransactionCommit failed: " + std::to_string(error));
         return false;
+    }
+
+    // RECOVERY SIGNATURE GUARD - validate the interp_exec_state rewind site before trusting the VEH's EIP-rewind recovery
+    // A co-resident interpreter patcher or a mismatched build alters those bytes, and the rewind would then corrupt the state
+    // On mismatch recovery is off and faults fall through to the non-recoverable diagnostic path
+    uintptr_t execStateAddr = Addresses::Methods.interp_exec_state;
+    s_interpRecoveryEnabled = InterpRecoverySignatureIntact(execStateAddr);
+    if (!s_interpRecoveryEnabled) {
+        LOG_WARN("[ExceptionHook] interp_exec_state recovery signature MISMATCH @ " + ToHex(execStateAddr) + " - VEH EIP-rewind recovery DISABLED (co-resident interpreter patch or build mismatch)");
+        ModLog::Get().Log("[Runtime]", "Interpreter recovery disabled: interp_exec_state signature altered (possible co-resident patcher)", LogLevel::Warn);
     }
 
     // VEH for native crashes in interpreter
@@ -174,6 +198,29 @@ void __cdecl ExceptionHook::HookedGError(const char* format, ...) {
     s_originalGError("%s", buffer);
 }
 
+// QUARANTINE ATTRIBUTION - runs in a post-AV context where the process is likely dying and the heap may be fragile, so the whole body sits inside __try
+// A secondary fault is swallowed and the original crash still proceeds to its dump, since the VEH returns CONTINUE_SEARCH either way
+// POD locals only, because __try needs an object-free frame... QuarantineBakedChain's formatting and file work lives in its own callee frame (allocation-free: stack buffers + WriteFile on pre-opened handles)
+static void TryQuarantineFaultingBakedChain(void* threadCtxV, const char* reason) {
+    __try {
+        ThreadContext* tc = reinterpret_cast<ThreadContext*>(threadCtxV);
+        // Attribute only to the innermost frame, the method actually executing at the fault
+        // Walking to an ancestor would blame a baked caller for a crash inside a non-baked callee it invoked, so one unrelated interpreter AV would disable a good bake
+        // mis-attribution bad, missing attribution okay
+        InterpFrame* f = tc ? tc->current_frame : nullptr;
+        if (!f || !IsValidPointer(f)) return;
+        RuntimeMethod* rtm = f->runtime_method;
+        if (!rtm || !IsValidPointer(rtm) || !rtm->method || !IsValidPointer(rtm->method)) return;
+        if (HookManager::Get().QuarantineBakedChain(rtm->method, reason)) { // no-ops unless it's an active baked target
+            // Baked-target fault, so append the typed forensic record (faulting link, ip offset, this, per-arg values) to baked_crashes.log
+            // Same fragile-context rules - the callee guards every deref, and a secondary fault lands in this frame's __except
+            HookManager::Get().DumpBakedCrashRecord(rtm->method, f, reason);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        // a secondary fault while attributing - swallow; the original crash proceeds via CONTINUE_SEARCH
+    }
+}
+
 // VEH HANDLER - First-chance native crash handler for interpreter. Checks if faulting EIP is within interp_exec_state, logs frame state, then lets normal crash handling proceed.
 LONG CALLBACK ExceptionHook::VectoredExceptionHandler(PEXCEPTION_POINTERS exInfo) {
     // Reentrancy guard - if our logging itself faults, bail immediately
@@ -209,10 +256,8 @@ LONG CALLBACK ExceptionHook::VectoredExceptionHandler(PEXCEPTION_POINTERS exInfo
     //
     // Fires every tick for hooked methods with stale eval stack exception slots.
     // Rate-limited logging, full diagnostics on first 3 hits, then silent recovery.
-    constexpr DWORD CRASH_OFFSET = 0x0C3A;  // MOV ECX, [EAX]
-    constexpr DWORD REWIND_OFFSET = 0x0C2C; // TEST EAX, EAX
-
-    if (code == EXCEPTION_ACCESS_VIOLATION && (eip - execStateAddr) == CRASH_OFFSET && exInfo->ContextRecord->Eax < 0x10000) // small integer, not a valid pointer
+    // Gated on the signature guard - if a co-resident patch or a build mismatch altered the rewind site, s_interpRecoveryEnabled is false and we fall through to diagnostics rather than rewinding EIP onto shifted instructions
+    if (s_interpRecoveryEnabled && code == EXCEPTION_ACCESS_VIOLATION && (eip - execStateAddr) == INTERP_CRASH_OFFSET && exInfo->ContextRecord->Eax < 0x10000) // small integer, not a valid pointer
     {
         static volatile LONG s_recoveryCount = 0;
         LONG count = InterlockedIncrement(&s_recoveryCount);
@@ -223,7 +268,7 @@ LONG CALLBACK ExceptionHook::VectoredExceptionHandler(PEXCEPTION_POINTERS exInfo
         exInfo->ContextRecord->Eax = 0; // EAX register
 
         // Rewind EIP to TEST EAX,EAX, the JZ will now take the "no exception" path
-        exInfo->ContextRecord->Eip = execStateAddr + REWIND_OFFSET;
+        exInfo->ContextRecord->Eip = execStateAddr + INTERP_REWIND_OFFSET;
 
         // Rate-limited logging: full details for first 3, periodic summary after
         if (count <= 3) {
@@ -288,8 +333,29 @@ LONG CALLBACK ExceptionHook::VectoredExceptionHandler(PEXCEPTION_POINTERS exInfo
         LOG_ERROR("[ExceptionHook:VEH]   Frame chain: <unavailable>");
     }
 
+    // CO-RESIDENT ATTRIBUTION - when the fault address lands inside another native mod's module, name it in the crash record so the log reads "conflict with <OtherMod.dll>" instead of blaming MM
+    // Snapshot lookup only (Memory::SnapshotModules ran at mono-ready), so it is safe in this post-crash context ;))
+    std::string culprit = Memory::ResolveModuleForAddress(faultAddr);
+    if (!culprit.empty()) {
+        LOG_ERROR("[ExceptionHook:VEH]   fault address in co-resident module " + culprit);
+        ModLog::Get().Log("[Runtime]", "Interpreter crash faulted inside co-resident module " + culprit, LogLevel::Error);
+    }
+
     // Non-recoverable crash, log to ModLog and let normal crash handling proceed
     ModLog::Get().Log(assemblyName.empty() ? "[Runtime]" : assemblyName, "NATIVE CRASH in interpreter @ " + ToHex(eip) + " accessing " + ToHex(faultAddr) + (frameChain.empty() ? "" : " | " + frameChain), LogLevel::Error);
+
+    // CRASH QUARANTINE - record a hit against the baked chain executing at the fault, so a repeatedly-crashing baked target boxes or drops on a later launch instead of crashing again
+    // Innermost frame only, see TryQuarantineFaultingBakedChain 4 moree
+    // The reentrancy guard is held throughout and attribution is SEH-isolated, so the original crash proceeds regardless and the quarantine takes effect on a future run
+    // Plain stack buffer for reason, so no std::string is constructed in the fragile context
+    if (Addresses::Profiler.g_thread_context_tls_index) {
+        DWORD tlsIndex = *(DWORD*)Addresses::Profiler.g_thread_context_tls_index;
+        if (void* ctxv = TlsGetValue(tlsIndex)) {
+            char reason[192];
+            _snprintf_s(reason, sizeof(reason), _TRUNCATE, "%s interp_exec_state+0x%X accessing 0x%08X", codeStr.c_str(), (unsigned)(eip - execStateAddr), (unsigned)faultAddr);
+            TryQuarantineFaultingBakedChain(ctxv, reason);
+        }
+    }
 
     InterlockedExchange(&s_inVehHandler, 0);
     return EXCEPTION_CONTINUE_SEARCH; // let normal crash handling proceed

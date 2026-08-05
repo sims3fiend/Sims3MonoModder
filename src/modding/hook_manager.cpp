@@ -7,8 +7,13 @@
 #include "../cache/cache_api.h"
 #include "../util/logger.h"
 #include "../util/mod_log.h"
+#include "../util/config_paths.h"
 #include "../core/exception_helper.h"
+#include "../core/exception_hook.h"
 #include <algorithm>
+#include <cstdarg>
+#include <cstring>
+#include <fstream>
 #include <Windows.h>
 
 namespace S3MM {
@@ -110,6 +115,7 @@ bool HookManager::Initialize() {
     MonoBridge::Get().AddInternalCall("S3MM.Native::CallNext", (void*)&HookManager::NativeCallNext);
     MonoBridge::Get().AddInternalCall("S3MM.Native::CallOriginal", (void*)&HookManager::NativeCallOriginal);
     MonoBridge::Get().AddInternalCall("S3MM.Native::GetCallerHookToken", (void*)&HookManager::NativeGetCallerHookToken);
+    MonoBridge::Get().AddInternalCall("S3MM.Native::TargetIsInstance", (void*)&HookManager::NativeTargetIsInstance);
 
     // Auto-prefixed log API (S3MM.Log class)
     MonoBridge::Get().AddInternalCall("S3MM.Log::Info", (void*)&HookManager::NativeLogInfo);
@@ -189,11 +195,15 @@ bool HookManager::Initialize() {
     MonoBridge::Get().AddInternalCall("S3MM.Cache::GetStaticFieldChar", (void*)&CacheAPI::NativeGetStaticFieldChar);
     MonoBridge::Get().AddInternalCall("S3MM.Cache::SetStaticFieldChar", (void*)&CacheAPI::NativeSetStaticFieldChar);
 
-    // Hook by pointer
+    // Hook by pointer (baking is inferred from the handler's IL - no separate typed entry point)
     MonoBridge::Get().AddInternalCall("S3MM.Hook::RegisterByPointer", (void*)&HookManager::NativeRegisterHookByPointer);
+    // Apply pending hook changes on demand (reinstall + apply) - lets a mod commit a runtime registration
+    MonoBridge::Get().AddInternalCall("S3MM.Hook::ApplyPending", (void*)&HookManager::NativeApplyPendingHooks);
 
     // Audit API - hook/conflict introspection for managed diagnostic tools (e.g. NRaas ErrorTrap)
     MonoBridge::Get().AddInternalCall("S3MM.Audit::IsMethodHooked", (void*)&AuditAPI::NativeIsMethodHooked);
+    MonoBridge::Get().AddInternalCall("S3MM.Audit::IsMethodBaked", (void*)&AuditAPI::NativeIsMethodBaked);
+    MonoBridge::Get().AddInternalCall("S3MM.Audit::GetBakeRejectReason", (void*)&AuditAPI::NativeGetBakeRejectReason);
     MonoBridge::Get().AddInternalCall("S3MM.Audit::IsAssemblyReplaced", (void*)&AuditAPI::NativeIsAssemblyReplaced);
     MonoBridge::Get().AddInternalCall("S3MM.Audit::GetHookedMethodCount", (void*)&AuditAPI::NativeGetHookedMethodCount);
     MonoBridge::Get().AddInternalCall("S3MM.Audit::GetAllHooks", (void*)&AuditAPI::NativeGetAllHooks);
@@ -207,6 +217,17 @@ bool HookManager::Initialize() {
     return true;
 }
 
+// DISPATCH TOKEN ALLOCATION - see HookChain::dispatchToken
+// Prefer the target's real MethodDef token; on a cross-assembly collision probe upward in 0x01000000 steps, leaving the 0x06xxxxxx MethodDef space (the value is opaque to managed code, so any unique u32 works)
+uint32_t HookManager::AllocateDispatchToken(uint32_t preferredToken, void* targetMethod) {
+    uint32_t key = preferredToken;
+    for (;;) {
+        auto it = m_tokenToMethod.find(key);
+        if (it == m_tokenToMethod.end() || it->second == targetMethod) return key; // free, or already this chain's
+        key += 0x01000000;
+    }
+}
+
 // HOOK REGISTRATION - Register a hook or watcher by class/method name
 bool HookManager::RegisterHook(const std::string& targetClass, const std::string& targetMethod, void* hookMethod, HookType type, const std::string& modName, int priority, const std::string& signature) {
     if (!hookMethod) {
@@ -217,10 +238,21 @@ bool HookManager::RegisterHook(const std::string& targetClass, const std::string
     std::string sigInfo = signature.empty() ? "" : signature;
     LOG_INFO("[HookManager] Registering " + std::string(type == HookType::Hook ? "hook" : "watcher") + ": " + targetClass + ":" + targetMethod + sigInfo + " from mod: " + modName);
 
+    // Derive the registering hook's image so a target in a mod assembly (self-targeting) can resolve even though ScriptHost::FindClass only searches game assemblies
+    void* resolveImage = nullptr;
+    if (auto* hl = reinterpret_cast<MonoMethodLayout*>(hookMethod); hl && hl->klass) { resolveImage = *(void**)((uintptr_t)hl->klass + Offsets::CLASS_IMAGE); }
+
     // Find or create the hook chain
-    void* originalMethod = FindTargetMethod(targetClass, targetMethod, signature);
+    void* originalMethod = FindTargetMethod(targetClass, targetMethod, signature, resolveImage);
     if (!originalMethod) {
         LOG_ERROR("[HookManager] Target method not found: " + targetClass + ":" + targetMethod + sigInfo);
+        return false;
+    }
+
+    // Same refusal as the by-pointer path - a nested class inside a generic type, or an inherited member reached through one, can land here inflated even though the attribute named a plain type
+    // Inflated targets are supported (full-size trampoline copy); only open generic definitions and corrupt shapes refuse
+    if (std::string hazard = DescribeTrampolineHazard(originalMethod); !hazard.empty()) {
+        LOG_ERROR("[HookManager] RegisterHook: refusing target " + targetClass + ":" + targetMethod + sigInfo + " from mod '" + modName + "' - " + hazard + ". See the generic-target notes in the modding docs.");
         return false;
     }
 
@@ -241,6 +273,7 @@ bool HookManager::RegisterHook(const std::string& targetClass, const std::string
     entry.hookMethod = hookMethod;
     entry.type = type;
     entry.priority = priority;
+    entry.usesChain = ChainCompiler::HookUsesChain(hookMethod); // inferred bake candidacy (no opt-in flag)
 
     // Add to appropriate list
     if (type == HookType::Hook) {
@@ -264,32 +297,65 @@ bool HookManager::RegisterHook(const std::string& targetClass, const std::string
     // Mark for reinstall so ReinstallDispatchStubs will update the stub to the new hook[0].
     if (chain.isPatched) { chain.needsReinstall = true; }
 
-    // Track token -> method mapping for dispatch.
-    // Use chain.originalToken (backed up before patching) for consistency; the live MonoMethodLayout is now identity-preserving but the backup is the canonical source.
-    uint32_t origToken = chain.originalToken;
-    m_tokenToMethod[origToken] = originalMethod;
+    // Track token -> method mapping for dispatch, keyed by the chain's unique dispatch token (see HookChain::dispatchToken)
+    if (chain.dispatchToken == 0) {
+        chain.dispatchToken = AllocateDispatchToken(chain.originalToken, originalMethod);
+        if (chain.dispatchToken != chain.originalToken)
+            LOG_INFO("[HookManager] MethodDef token " + std::to_string(chain.originalToken) + " already claimed by another assembly's target; " + targetClass + "::" + targetMethod + " dispatches via synthetic token " +
+                     std::to_string(chain.dispatchToken));
+    }
+    uint32_t dispToken = chain.dispatchToken;
+    m_tokenToMethod[dispToken] = originalMethod;
 
     // Track hook method -> token for auto-token resolution via GetCallerHookToken frame walk
-    m_hookMethodToToken[hookMethod] = origToken;
+    m_hookMethodToToken[hookMethod] = dispToken;
 
     // Also store by (image, hookToken) composite key, more reliable since MonoMethod* can differ at runtime.
     // Using a composite key because hook tokens can collide across different mod assemblies.
     auto* hookLayout = reinterpret_cast<MonoMethodLayout*>(hookMethod);
     void* hookImage = hookLayout->klass ? *(void**)((uintptr_t)hookLayout->klass + Offsets::CLASS_IMAGE) : nullptr;
     uint64_t compositeKey = MakeHookTokenKey(hookImage, hookLayout->token);
-    m_hookTokenToTargetToken[compositeKey] = origToken;
+    m_hookTokenToTargetToken[compositeKey] = dispToken;
     LOG_DEBUG("[HookManager] Stored hook method @ " + std::to_string((uintptr_t)hookMethod) + " (hookToken=" + std::to_string(hookLayout->token) + ", image=" + std::to_string((uintptr_t)hookImage) + ")" +
-              " -> targetToken " + std::to_string(origToken));
+              " -> dispatchToken " + std::to_string(dispToken));
 
     LOG_INFO("[HookManager] Hook registered. Chain now has " + std::to_string(chain.hooks.size()) + " hooks (" + std::to_string(chain.watchers.size()) + " watchers)");
 
     return true;
 }
 
+// NESTED-AWARE CLASS PATH - "Ns.Outer/Inner/Definition" for by-pointer registrations: the bare name collides across mods in Audit's classMethod index and the quarantine key
+// Walks CLASS_NESTED_IN innermost->outermost and prepends the outermost namespace; a non-nested class gets plain "Ns.Class"
+// An INFLATED class carries its generic definition's name ("GenBox`1"), so instantiations share Audit/quarantine strings (chains stay distinct, keyed by MonoMethod*)
+static std::string DeriveFullClassName(void* klass) {
+    if (!klass || !IsReadablePointer(klass, Offsets::CLASS_NESTED_IN + sizeof(void*))) return "???";
+    std::string path;
+    void* k = klass;
+    for (int depth = 0; k && depth < 8; ++depth) {
+        const char* cls = *(const char**)((uintptr_t)k + Offsets::CLASS_NAME);
+        path = std::string((cls && IsReadablePointer((void*)cls, 2)) ? cls : "???") + (path.empty() ? "" : "/" + path);
+        void* outer = *(void**)((uintptr_t)k + Offsets::CLASS_NESTED_IN);
+        if (!outer || !IsReadablePointer(outer, Offsets::CLASS_NESTED_IN + sizeof(void*))) {
+            const char* ns = *(const char**)((uintptr_t)k + Offsets::CLASS_NAMESPACE);
+            if (ns && IsReadablePointer((void*)ns, 2) && ns[0]) path = std::string(ns) + "." + path;
+            return path;
+        }
+        k = outer;
+    }
+    return path;
+}
+
 // HOOK REGISTRATION BY POINTER - Register using raw MonoMethod* directly
 bool HookManager::RegisterHookByPointer(void* targetMethod, void* hookMethod, HookType type, const std::string& modName, int priority) {
     if (!targetMethod || !hookMethod) {
         LOG_ERROR("[HookManager] RegisterHookByPointer: null target or hook method");
+        return false;
+    }
+
+    // Refuse unsound targets BEFORE anything reads their metadata - registration is the last recoverable point (downstream the failure mode is abort())
+    // Inflated targets are supported via the full-size trampoline copy; only open generic definitions and corrupt shapes refuse
+    if (std::string hazard = DescribeTrampolineHazard(targetMethod); !hazard.empty()) {
+        LOG_ERROR("[HookManager] RegisterHookByPointer: refusing target @ " + ToHex((uintptr_t)targetMethod) + " from mod '" + modName + "' - " + hazard + ". See the generic-target notes in the modding docs.");
         return false;
     }
 
@@ -310,15 +376,9 @@ bool HookManager::RegisterHookByPointer(void* targetMethod, void* hookMethod, Ho
         originalToken = existingIt->second.originalToken;
     } else {
         // New chain - MonoMethodLayout is unpatched, safe to read directly
+        // Nested-qualified path (Ns.Outer/Inner) so Audit lookups and quarantine keys are unambiguous
         targetMethodName = targetLayout->name ? targetLayout->name : "???";
-        if (targetLayout->klass) {
-            const char* ns = *(const char**)((uintptr_t)targetLayout->klass + Offsets::CLASS_NAMESPACE);
-            const char* cls = *(const char**)((uintptr_t)targetLayout->klass + Offsets::CLASS_NAME);
-            if (ns && ns[0])
-                targetClassName = std::string(ns) + "." + (cls ? cls : "???");
-            else
-                targetClassName = cls ? cls : "???";
-        }
+        targetClassName = DeriveFullClassName(targetLayout->klass);
         originalToken = targetLayout->token;
     }
 
@@ -342,6 +402,7 @@ bool HookManager::RegisterHookByPointer(void* targetMethod, void* hookMethod, Ho
     entry.hookMethod = hookMethod;
     entry.type = type;
     entry.priority = priority;
+    entry.usesChain = ChainCompiler::HookUsesChain(hookMethod); // inferred bake candidacy (no opt-in flag)
 
     // Add to appropriate list (identical logic to RegisterHook)
     if (type == HookType::Hook) {
@@ -357,34 +418,39 @@ bool HookManager::RegisterHookByPointer(void* targetMethod, void* hookMethod, Ho
 
     if (chain.isPatched) { chain.needsReinstall = true; }
 
-    // Track token -> method mapping for dispatch (use ORIGINAL token, not patched)
-    m_tokenToMethod[originalToken] = targetMethod;
+    // Track token -> method mapping for dispatch, keyed by the chain's unique dispatch token (see HookChain::dispatchToken)
+    if (chain.dispatchToken == 0) {
+        chain.dispatchToken = AllocateDispatchToken(originalToken, targetMethod);
+        if (chain.dispatchToken != originalToken)
+            LOG_INFO("[HookManager] MethodDef token " + std::to_string(originalToken) + " already claimed by another assembly's target; " + targetClassName + "::" + targetMethodName + " dispatches via synthetic token " +
+                     std::to_string(chain.dispatchToken));
+    }
+    uint32_t dispToken = chain.dispatchToken;
+    m_tokenToMethod[dispToken] = targetMethod;
 
     // Track hook method -> token for auto-token resolution via GetCallerHookToken
-    m_hookMethodToToken[hookMethod] = originalToken;
+    m_hookMethodToToken[hookMethod] = dispToken;
 
     // Also store by (image, hookToken) composite key
     auto* hookLayout = reinterpret_cast<MonoMethodLayout*>(hookMethod);
     void* hookImage = hookLayout->klass ? *(void**)((uintptr_t)hookLayout->klass + Offsets::CLASS_IMAGE) : nullptr;
     uint64_t compositeKey = MakeHookTokenKey(hookImage, hookLayout->token);
-    m_hookTokenToTargetToken[compositeKey] = originalToken;
+    m_hookTokenToTargetToken[compositeKey] = dispToken;
 
     LOG_INFO("[HookManager] Hook registered by pointer. Chain now has " + std::to_string(chain.hooks.size()) + " hooks (" + std::to_string(chain.watchers.size()) + " watchers)" +
-             ", originalToken=" + std::to_string(originalToken));
+             ", originalToken=" + std::to_string(originalToken) + (dispToken != originalToken ? " (dispatchToken=" + std::to_string(dispToken) + ")" : ""));
 
     return true;
 }
 
-// NativeRegisterHookByPointer - internal call entry point from managed code
-void __cdecl HookManager::NativeRegisterHookByPointer(void* targetMethod, void* hookMethod, int32_t hookType, int32_t priority) {
-    // Derive mod name from the hook method's image.
+// Resolve the logical mod name from a hook method's image (stable across hot-reloads)
+static std::string ResolveModNameForHook(void* hookMethod) {
     std::string modName = "unknown";
     if (hookMethod) {
         auto* hookLayout = reinterpret_cast<MonoMethodLayout*>(hookMethod);
         if (hookLayout->klass) {
             void* image = *(void**)((uintptr_t)hookLayout->klass + Offsets::CLASS_IMAGE);
             if (image) {
-                // Prefer the logical mod name (stable across hot-reloads). Fall back to the assembly name for non-S3MM/standalone images.
                 std::string logical = ModLoader::Get().GetModNameForImage(image);
                 if (!logical.empty()) {
                     modName = logical;
@@ -395,9 +461,28 @@ void __cdecl HookManager::NativeRegisterHookByPointer(void* targetMethod, void* 
             }
         }
     }
+    return modName;
+}
 
+// Baking is inferred from the handler's IL (HookUsesChain) at registration; there is no separate typed entry point
+void __cdecl HookManager::NativeRegisterHookByPointer(void* targetMethod, void* hookMethod, int32_t hookType, int32_t priority) {
     HookType type = (hookType == 1) ? HookType::Watcher : HookType::Hook;
-    HookManager::Get().RegisterHookByPointer(targetMethod, hookMethod, type, modName, priority);
+    HookManager::Get().RegisterHookByPointer(targetMethod, hookMethod, type, ResolveModNameForHook(hookMethod), priority);
+}
+
+// Commit pending hook changes without a mod reload: recompile chains marked needsReinstall (baked chains in place), then install any not-yet-patched chains
+void __cdecl HookManager::NativeApplyPendingHooks() {
+    HookManager::Get().ReinstallDispatchStubs();
+    HookManager::Get().ApplyHooks();
+}
+
+// Is the target behind this token an instance method? Used by the un-baked Chain.CallNext boxing fallback to split a leading-self arg from the params (managed can't read the target's hasThis); 0 for an unknown token
+int32_t __cdecl HookManager::NativeTargetIsInstance(uint32_t methodToken) {
+    auto& mgr = HookManager::Get();
+    auto it = mgr.m_tokenToMethod.find(methodToken);
+    if (it == mgr.m_tokenToMethod.end()) return 0;
+    HookChain* chain = mgr.GetChain(it->second);
+    return (chain && chain->originalIsInstance) ? 1 : 0;
 }
 
 // REMOVE HOOKS FOR MOD - Unregister all hooks belonging to a given mod name
@@ -461,6 +546,16 @@ int HookManager::ApplyHooks() {
     for (auto& [method, chain] : m_chains) {
         if (chain.isPatched) continue;
 
+        // Prefer the zero-overhead baked chain when every entry opts in and the signatures line up
+        if (ChainBakeEligible(chain) && TryInstallBakedChain(chain)) {
+            applied++;
+            continue;
+        }
+
+        // Not baked (ineligible, or compile/install failed) - demote-or-reject the typed entries
+        DemoteIneligibleTypedHooks(chain);
+        if (chain.hooks.empty()) continue; // nothing installable left
+
         if (InstallDispatchStub(chain)) { applied++; }
     }
 
@@ -477,6 +572,35 @@ int HookManager::ReinstallDispatchStubs() {
 
         // Clear the flag first
         chain.needsReinstall = false;
+
+        // BAKED CHAIN - recompile the linked-RTM dispatch in place (or tear down if emptied)
+        if (chain.bakedActive) {
+            if (chain.hooks.empty()) {
+                // No hooks left - point the target back at its original RTM (or null to force a fresh transform of the original IL); identity was never clobbered, so this fully restores it
+                auto* layout = reinterpret_cast<MonoMethodLayout*>(chain.originalMethod);
+                DWORD oldProtect;
+                if (VirtualProtect(chain.originalMethod, sizeof(MonoMethodLayout), PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                    layout->runtimeMethod = chain.originalRuntimeMethod; // backup captured pre-patch (may be null)
+                    VirtualProtect(chain.originalMethod, sizeof(MonoMethodLayout), oldProtect, &oldProtect);
+                    chain.bakedActive = false;
+                    chain.isPatched = false;
+                    m_compiledChains.erase(chain.originalMethod);
+                    reinstalled++;
+                    LOG_INFO("[HookManager] Restored original method (baked chain emptied): " + chain.targetClass + "::" + chain.targetMethod);
+                } else {
+                    LOG_ERROR("[HookManager] Failed to restore original method (baked, VirtualProtect failed): " + chain.targetClass + "::" + chain.targetMethod);
+                }
+            } else if (RecompileBakedChain(chain)) {
+                reinstalled++;
+                LOG_INFO("[HookManager] Recompiled baked chain: " + chain.targetClass + "::" + chain.targetMethod);
+            } else {
+                LOG_ERROR("[HookManager] Failed to recompile baked chain: " + chain.targetClass + "::" + chain.targetMethod);
+            }
+            continue;
+        }
+
+        // RUNTIME-REGISTERED TYPED HOOKS - a Chain.* hook added to an already-boxed chain gets the same demote/reject pass as first install (a Chain.ByRef hook is REJECTED rather than boxed into per-call NotRewritten throws)
+        DemoteIneligibleTypedHooks(chain);
 
         if (chain.hooks.empty()) {
             // No hooks left - restore original method fields so the game method runs its own IL again instead of dispatching through a stale stub.
@@ -530,10 +654,16 @@ HookChain* HookManager::GetChain(void* originalMethod) {
 }
 
 HookChain* HookManager::GetChainByName(const std::string& targetClass, const std::string& targetMethod) {
+    // A hot-reload empties the old chain but retains it in m_chains, so a first-match name lookup can hash-order-randomly return the stale duplicate and read dead state
+    // Prefer a chain with LIVE entries (same liveness test as RebuildClassMethodIndex); fall back to a stale match only if none is live
+    HookChain* stale = nullptr;
     for (auto& [method, chain] : m_chains) {
-        if (chain.targetClass == targetClass && chain.targetMethod == targetMethod) { return &chain; }
+        if (chain.targetClass == targetClass && chain.targetMethod == targetMethod) {
+            if (!chain.hooks.empty() || !chain.watchers.empty()) { return &chain; }
+            stale = &chain;
+        }
     }
-    return nullptr;
+    return stale;
 }
 
 // SIGNATURE PARSING AND MATCHING - Normalize user type names to Mono canonical format
@@ -842,7 +972,7 @@ bool HookManager::MethodMatchesSignature(void* method, const std::vector<std::st
 }
 
 // FIND TARGET METHOD - Resolve a class/method/signature to a MonoMethod*
-void* HookManager::FindTargetMethod(const std::string& targetClass, const std::string& targetMethod, const std::string& signature) {
+void* HookManager::FindTargetMethod(const std::string& targetClass, const std::string& targetMethod, const std::string& signature, void* preferImage) {
     // Parse class name into namespace and class, handling nested types with '+' separator
     size_t lastDot = targetClass.rfind('.');
     std::string ns = (lastDot != std::string::npos) ? targetClass.substr(0, lastDot) : "";
@@ -891,6 +1021,12 @@ void* HookManager::FindTargetMethod(const std::string& targetClass, const std::s
         klass = MonoBridge::Get().GetClassByName(ns.c_str(), className.c_str());
     }
 
+    if (!klass && preferImage) {
+        // ScriptHost::FindClass only searches game assemblies; for a target in a mod assembly (self-targeting / mod-to-mod) fall back to the registering hook's own image
+        klass = MonoBridge::Get().GetClassFromNameInImage(preferImage, ns.c_str(), className.c_str());
+        if (klass) LOG_DEBUG("[HookManager] Resolved '" + targetClass + "' via hook-image fallback");
+    }
+
     if (!klass) {
         LOG_ERROR("[HookManager] Class not found: " + targetClass);
         return nullptr;
@@ -936,7 +1072,7 @@ void* HookManager::FindTargetMethod(const std::string& targetClass, const std::s
             return method;
         }
 
-        // Fallback: try the old type-code-based matching for simple cases where the user wrote "int,int" and Mono returns "int,int".
+        // Fallback: try the type-code-based matching for simple cases where the user wrote "int,int" and Mono returns "int,int"
         std::vector<std::string> expectedParams = ParseSignature(signature);
         if (MethodMatchesSignature(method, expectedParams)) {
             LOG_DEBUG("[HookManager] Found matching overload (type-code match)");
@@ -956,6 +1092,44 @@ void* HookManager::FindTargetMethod(const std::string& targetClass, const std::s
     return nullptr;
 }
 
+// GENERIC-TARGET SAFETY - see hook_manager.h
+// INFLATED targets are SUPPORTED: CloneMethod copies the full 0x30-byte MonoMethodInflated (context @+0x28, declaring @+0x2C), so the forced re-transform resolves like the original's
+// Refused: open generic method definitions (no context to inflate with), inflated methods with unreadable context/declaring, and the corrupt generic_class-without-is_inflated shape
+std::string HookManager::DescribeTrampolineHazard(void* method) {
+    if (!method || !IsReadablePointer(method, sizeof(MonoMethodLayout))) return "method pointer is not readable";
+
+    auto* layout = reinterpret_cast<MonoMethodLayout*>(method);
+
+    // Open generic method definition - no context to inflate with
+    // Checked before the inflated probe: a MethodSpec instantiation of a generic METHOD has both container-on-declaring and is_inflated
+    if (!(layout->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG) && layout->genericContainer) {
+        return "it is an open generic method definition (generic_container set at +0x10); "
+               "hook a constructed instantiation instead";
+    }
+
+    if (layout->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG) {
+        // Inflated method - trampolinable via the full-size copy, provided the extension is intact
+        if (!IsReadablePointer(method, sizeof(MonoMethodInflatedLayout))) { return "it is an inflated generic method but the 0x30-byte MonoMethodInflated span is not readable"; }
+        auto* inflated = reinterpret_cast<MonoMethodInflatedLayout*>(method);
+        if (!inflated->declaring || !IsReadablePointer(inflated->declaring, sizeof(MonoMethodLayout))) { return "it is an inflated generic method with an unreadable declaring method (+0x2C)"; }
+        // context is never null on a runtime-built inflated method (the inflation path always allocates it);
+        // transform_method hands it to token resolution unconditionally when the sig's inflated bit is set
+        if (!inflated->context || !IsReadablePointer(inflated->context, 8)) { return "it is an inflated generic method with an unreadable generic context (+0x28)"; }
+        return {};
+    }
+
+    // Contradictory shape: constructed-generic declaring class but is_inflated clear
+    if (layout->klass && IsReadablePointer(layout->klass, Offsets::CLASS_GENERIC_CLASS + sizeof(void*))) {
+        void* genericClass = *(void**)((uintptr_t)layout->klass + Offsets::CLASS_GENERIC_CLASS);
+        if (genericClass) {
+            return "its declaring type is a generic instantiation (klass->generic_class set at +0xA8) but "
+                   "is_inflated is clear - the loader never produces this shape, refusing as corrupt";
+        }
+    }
+
+    return {};
+}
+
 // BACKUP ORIGINAL METHOD - Snapshot original MonoMethod fields and create trampoline
 void HookManager::BackupOriginalMethod(HookChain& chain) {
     auto* layout = reinterpret_cast<MonoMethodLayout*>(chain.originalMethod);
@@ -965,17 +1139,20 @@ void HookManager::BackupOriginalMethod(HookChain& chain) {
     chain.originalRuntimeMethod = layout->runtimeMethod;
 
     // Create a heap-allocated trampoline copy of the MonoMethod that retains the original values and can be used to invoke the original.
-    auto* trampoline = new MonoMethodLayout(*layout);
-
-    // CRITICAL: Clear runtimeMethod on the trampoline to force fresh compilation.
-    // The original runtimeMethod contains RuntimeMethod->method which points back to the ORIGINAL MonoMethod.
-    // After we patch the original, that back-pointer leads to the patched (hook) token/klass, causing crashes or wrong behavior.
-    // By clearing runtimeMethod, Mono will compile fresh for the trampoline, with RuntimeMethod->method pointing to our trampoline copy.
-    trampoline->runtimeMethod = nullptr;
+    // CloneMethod is SIZE-AWARE: an inflated target is copied as the full 0x30-byte MonoMethodInflated, so context (+0x28) / declaring (+0x2C) survive the re-transform
+    // It also clears runtimeMethod: the original RTM's ->method back-pointer leads to the patched identity after install, so the trampoline compiles fresh with its own
+    void* trampoline = ChainCompiler::CloneMethod(chain.originalMethod);
+    if (!trampoline) {
+        // Registration already ran DescribeTrampolineHazard, so this is an unexpected readability failure
+        LOG_ERROR("[HookManager] BackupOriginalMethod: clone failed for token=" + std::to_string(chain.originalToken) + " - chain left without a trampoline (CallNext to the original will fail)");
+        return;
+    }
 
     chain.trampolineMethod = trampoline;
 
-    LOG_DEBUG("[HookManager] Backed up original method: token=" + std::to_string(chain.originalToken) + ", trampoline=" + std::to_string((uintptr_t)trampoline) + " (runtimeMethod cleared for fresh compilation)");
+    bool inflated = (layout->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG) != 0;
+    LOG_DEBUG("[HookManager] Backed up original method: token=" + std::to_string(chain.originalToken) + ", trampoline=" + std::to_string((uintptr_t)trampoline) +
+              (inflated ? " (inflated - full 0x30 copy w/ context+declaring)" : "") + " (runtimeMethod cleared for fresh compilation)");
 
     // Determine if original is instance method (check STATIC flag)
     auto* origLayout = reinterpret_cast<MonoMethodLayout*>(chain.originalMethod);
@@ -990,8 +1167,10 @@ void HookManager::BackupOriginalMethod(HookChain& chain) {
 void HookManager::CacheSignatureInfo(HookChain& chain) {
     if (chain.signatureCached) return;
 
-    auto* layout = reinterpret_cast<MonoMethodLayout*>(chain.originalMethod);
-    void* sig = layout->signature;
+    // Resolve via the bridge, NOT the raw layout->signature field: Mono populates method->signature LAZILY on first mono_method_signature() call
+    // A freshly-compiled target that gameplay never invoked still has a null signature field, and a raw read would latch returnIsVoid=true and silently drop the return value
+    // GetMethodSignature forces the parse
+    void* sig = MonoBridge::Get().GetMethodSignature(chain.originalMethod);
 
     if (!sig) {
         chain.signatureCached = true;
@@ -1016,6 +1195,7 @@ void HookManager::CacheSignatureInfo(HookChain& chain) {
     chain.cachedParamCount = *(uint16_t*)((uintptr_t)sig + Offsets::SIG_PARAM_COUNT);
     chain.cachedParamTypes.resize(chain.cachedParamCount);
     chain.cachedParamIsValueType.resize(chain.cachedParamCount);
+    chain.cachedParamIsByRef.resize(chain.cachedParamCount);
 
     for (uint16_t i = 0; i < chain.cachedParamCount; i++) {
         void* paramType = *(void**)((uintptr_t)sig + Offsets::SIG_PARAMS + i * sizeof(void*));
@@ -1024,15 +1204,81 @@ void HookManager::CacheSignatureInfo(HookChain& chain) {
             chain.cachedParamTypes[i] = code;
             // Value types need unboxing (primitives and ValueType structs)
             chain.cachedParamIsValueType[i] = IsPrimitiveType(code) || code == MonoTypeCode::ValueType;
+            // By-ref (ref/out) positions - the ONLY positions where UnboxParametersFast may treat a single-element array as a Hook.Ref wrapper (same +0x07 & 0x40 read as SignatureInfo)
+            chain.cachedParamIsByRef[i] = ChainCompiler::TypeIsByRef(paramType);
         } else {
             chain.cachedParamTypes[i] = MonoTypeCode::Object;
             chain.cachedParamIsValueType[i] = false;
+            chain.cachedParamIsByRef[i] = false;
         }
     }
 
     chain.signatureCached = true;
     LOG_DEBUG("[HookManager] Cached signature: returnType=" + std::to_string((int)chain.cachedReturnType) + ", params=" + std::to_string(chain.cachedParamCount) +
               ", isPrimitive=" + std::to_string(chain.returnIsPrimitive) + ", isVoid=" + std::to_string(chain.returnIsVoid));
+}
+
+// ENTRY-HOOK ABI GUARD - the entry hook (hooks[0]) is compiled UNDER THE TARGET'S SIGNATURE, so its declared C# shape IS the ABI (ldarg.N typed by the target's params, `ret` writes the caller's return slot)
+// Failure mode: an `object`-declared hook over an enum/struct-returning target stores a boxed-object POINTER into the caller's value slot - every caller sees a ~0x4xxxxxxx "enum"; params corrupt the same way in reverse
+// Interior hooks (position > 0) are exempt - they're runtime-invoked with boxed args, so loosely-typed catch-all handlers stay legal there
+// Compatibility is SLOT-SHAPE, deliberately weaker than SignatureInfo::ExactMatch:
+//   - reference kinds interchange freely (an `object` return over a `Sim` target is one O slot either way)
+//   - value types (and enums), by-ref positions, and generic instantiations must match IDENTICALLY (slot encoding depends on the exact type)
+// Returns "" when compatible, else a one-line reason for the install-refusal ERROR
+static bool IsRefSlotCode(MonoTypeCode c) {
+    return c == MonoTypeCode::String || c == MonoTypeCode::Class || c == MonoTypeCode::Object || c == MonoTypeCode::SzArray;
+}
+
+static std::string AggregateTypeName(MonoTypeCode code, void* data); // defined with the bake diagnostics below
+
+static std::string DescribeEntryAbiMismatch(const SignatureInfo& target, const SignatureInfo& hook) {
+    if (!target.valid) return "target signature could not be read";
+    if (!hook.valid) return "entry hook signature could not be read";
+
+    // Return slot
+    bool retOk;
+    if (target.ret == MonoTypeCode::Void)
+        retOk = (hook.ret == MonoTypeCode::Void);
+    else if (IsRefSlotCode(target.ret) && IsRefSlotCode(hook.ret))
+        retOk = true; // any ref-to-ref
+    else
+        retOk = (hook.ret == target.ret && hook.retTypeData == target.retTypeData);
+    if (!retOk) {
+        return "return ABI mismatch: target returns " + AggregateTypeName(target.ret, target.retTypeData) + " (type-code " + std::to_string((int)target.ret) + ", a value slot) but the entry hook declares " +
+               AggregateTypeName(hook.ret, hook.retTypeData) + " (type-code " + std::to_string((int)hook.ret) + ") - the hook's boxed return pointer would land raw in the caller's value slot. " +
+               "Declare the target's EXACT return type on the hook";
+    }
+
+    // Param window: same-shape, or the leading-self convention for instance targets
+    uint16_t selfShift = 0;
+    if (target.hasThis && !hook.hasThis) {
+        if (hook.paramCount != (uint16_t)(target.paramCount + 1))
+            return "instance target: entry hook must declare a leading receiver param plus the target's " + std::to_string(target.paramCount) + " param(s), but declares " + std::to_string(hook.paramCount);
+        if (hook.paramCount == 0 || hook.paramIsByRef[0] || hook.paramIsValueType[0]) return "instance target: entry hook's leading receiver param must be a plain reference type";
+        selfShift = 1;
+    } else if (hook.hasThis != target.hasThis) {
+        return std::string("static/instance mismatch: target is ") + (target.hasThis ? "instance" : "static") + " but the entry hook is " + (hook.hasThis ? "an instance method" : "static");
+    } else if (hook.paramCount != target.paramCount) {
+        return "parameter count differs: target " + std::to_string(target.paramCount) + " vs entry hook " + std::to_string(hook.paramCount);
+    }
+
+    for (uint16_t i = 0; i < target.paramCount; ++i) {
+        uint16_t h = (uint16_t)(i + selfShift);
+        if (hook.paramIsByRef[h] != target.paramIsByRef[i]) return "param[" + std::to_string(i) + "] by-ref mismatch (byref positions are managed-pointer slots; both sides must agree)";
+        bool ok;
+        if (target.paramIsByRef[i])
+            ok = (hook.paramTypes[h] == target.paramTypes[i] && hook.paramTypeData[h] == target.paramTypeData[i]); // byref: pointee must match exactly
+        else if (IsRefSlotCode(target.paramTypes[i]) && IsRefSlotCode(hook.paramTypes[h]))
+            ok = true;
+        else
+            ok = (hook.paramTypes[h] == target.paramTypes[i] && hook.paramTypeData[h] == target.paramTypeData[i]);
+        if (!ok) {
+            return "param[" + std::to_string(i) + "] ABI mismatch: target takes " + AggregateTypeName(target.paramTypes[i], target.paramTypeData[i]) + " (type-code " + std::to_string((int)target.paramTypes[i]) +
+                   ") but the entry hook declares " + AggregateTypeName(hook.paramTypes[h], hook.paramTypeData[h]) + " (type-code " + std::to_string((int)hook.paramTypes[h]) + ")";
+        }
+    }
+
+    return {};
 }
 
 // INSTALL DISPATCH STUB - Patch original method to execute the first hook in chain
@@ -1052,8 +1298,21 @@ bool HookManager::InstallDispatchStub(HookChain& chain) {
     void* entryHook = chain.hooks[0].hookMethod;
     LOG_DEBUG("[HookManager] Using hook as entry point");
 
+    // ENTRY-HOOK ABI GUARD (see DescribeEntryAbiMismatch) - refuse the install rather than let a mismatched entry hook write pointer-shaped garbage into callers' value slots
+    // Target signature is read from the TRAMPOLINE copy (pristine after a prior clobber-path patch); generated dispatch wrappers match by construction and skip the check
+    if (!chain.hooks[0].hasWrapper) {
+        SignatureInfo targetSig = ChainCompiler::ReadSignature(chain.trampolineMethod ? chain.trampolineMethod : chain.originalMethod);
+        SignatureInfo entrySig = ChainCompiler::ReadSignature(entryHook);
+        if (std::string abi = DescribeEntryAbiMismatch(targetSig, entrySig); !abi.empty()) {
+            LOG_ERROR("[HookManager] REFUSING to install hook chain on " + chain.targetClass + "::" + chain.targetMethod + " - entry hook from mod '" + chain.hooks[0].modName + "' is ABI-incompatible: " + abi +
+                      ". The entry hook is compiled under the target's signature, so its declared parameter/return types are the call ABI. " +
+                      "The target stays UNHOOKED until the hook's declaration matches (loosely-typed handlers are only legal at lower priority behind a shape-matched entry hook).");
+            return false;
+        }
+    }
+
     // ForcePatchMethod compiles hook IL via a heap proxy and sets the fresh RTM on the original.
-    // Bypasses stale domain hash entries and preserves the original's identity fields.
+    // Sidesteps the can't-re-transform-a-transformed-method problem and preserves the original's identity fields.
     // If proxy compilation fails (never-compiled method), falls back to clobbering token/klass for lazy first-call compilation. deferred identity restoration happens in NativeGetCallerHookToken.
     bool deferred = false;
     if (!MethodPatcher::Get().ForcePatchMethod(chain.originalMethod, entryHook, &deferred, &chain.installedRTM)) {
@@ -1066,6 +1325,610 @@ bool HookManager::InstallDispatchStub(HookChain& chain) {
     LOG_INFO("[HookManager] Installed dispatch stub: " + chain.targetClass + "::" + chain.targetMethod);
 
     return true;
+}
+
+// BAKED CHAIN PATH - zero-overhead dispatch via a linked list of RuntimeMethods (ChainCompiler), downfall of my sanity, commence
+// DIAG - dump a SignatureInfo field-by-field (used when a typed hook is rejected by ExactMatch)
+static std::string DumpSig(const char* tag, const SignatureInfo& s) {
+    std::string out = std::string(tag) + ": valid=" + std::to_string(s.valid) + " hasThis=" + std::to_string(s.hasThis) + " ret=" + std::to_string((int)s.ret) + " retVT=" + std::to_string(s.retIsValueType) +
+                      " paramCount=" + std::to_string(s.paramCount) + " [";
+    for (uint16_t i = 0; i < s.paramCount; ++i) { out += "{t=" + std::to_string((int)s.paramTypes[i]) + " byref=" + std::to_string((int)s.paramIsByRef[i]) + " vt=" + std::to_string((int)s.paramIsValueType[i]) + "}"; }
+    out += "]";
+    return out;
+}
+
+// DIAG - render an aggregate identity word (SignatureInfo::paramTypeData) for a reject message: class name for Class/ValueType/SzArray, raw pointer for GenericInst (no direct name to read)
+static std::string AggregateTypeName(MonoTypeCode code, void* data) {
+    if (!data) return "?";
+    if (code == MonoTypeCode::Class || code == MonoTypeCode::ValueType || code == MonoTypeCode::SzArray) {
+        const char* n = MonoBridge::GetClassName(data);
+        if (n) return std::string(n) + (code == MonoTypeCode::SzArray ? "[]" : "");
+    }
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%p", data);
+    return buf;
+}
+
+// DIAG - one-line description of the FIRST structural difference between a same-shape (static) hook and the target, so a reject names exactly what to fix
+// Only reached on the static same-shape branch (the instance leading-self case is classified before this)
+static std::string DescribeSigMismatch(const SignatureInfo& target, const SignatureInfo& hook) {
+    if (!hook.valid) return "handler signature could not be read";
+    if (hook.ret != target.ret || hook.retIsValueType != target.retIsValueType) return "return type differs (target type-code " + std::to_string((int)target.ret) + " vs handler " + std::to_string((int)hook.ret) + ")";
+    if (hook.retTypeData != target.retTypeData)
+        return "return type differs (same type-code, different class/instantiation: target " + AggregateTypeName(target.ret, target.retTypeData) + " vs handler " + AggregateTypeName(hook.ret, hook.retTypeData) + ")";
+    if (hook.hasThis != target.hasThis) return std::string("static/instance mismatch (target is ") + (target.hasThis ? "instance" : "static") + ", handler is " + (hook.hasThis ? "instance" : "static") + ")";
+    if (hook.paramCount != target.paramCount) return "parameter count differs (target " + std::to_string(target.paramCount) + " vs handler " + std::to_string(hook.paramCount) + ")";
+    for (uint16_t i = 0; i < target.paramCount; ++i) {
+        if (hook.paramTypes[i] != target.paramTypes[i])
+            return "param[" + std::to_string(i) + "] type differs (target type-code " + std::to_string((int)target.paramTypes[i]) + " vs handler " + std::to_string((int)hook.paramTypes[i]) + ")";
+        if (hook.paramIsByRef[i] != target.paramIsByRef[i])
+            return "param[" + std::to_string(i) + "] by-ref differs (target " + std::to_string((int)target.paramIsByRef[i]) + " vs handler " + std::to_string((int)hook.paramIsByRef[i]) + ")";
+        if (hook.paramIsValueType[i] != target.paramIsValueType[i])
+            return "param[" + std::to_string(i) + "] value-type differs (target " + std::to_string((int)target.paramIsValueType[i]) + " vs handler " + std::to_string((int)hook.paramIsValueType[i]) + ")";
+        if (hook.paramTypeData[i] != target.paramTypeData[i])
+            return "param[" + std::to_string(i) + "] class differs (target " + AggregateTypeName(target.paramTypes[i], target.paramTypeData[i]) + " vs handler " +
+                   AggregateTypeName(hook.paramTypes[i], hook.paramTypeData[i]) + ")";
+    }
+    return "signatures differ but no single field could be isolated";
+}
+
+// CRASH QUARANTINE - persisted at S3MM/baked_quarantine.txt, see header
+
+static std::wstring BakeQuarantineFilePath() {
+    return ConfigPaths::GetS3MMDirectory() + L"baked_quarantine.txt";
+}
+
+std::string HookManager::BakeQuarantineKey(const HookChain& chain) {
+    // Signature-qualified so two hooked OVERLOADS don't share strikes (a bare Class::Method key let one crashing overload quarantine its siblings)
+    // chain.signature is the "(int,int)" disambiguator when registration provided one; "" degrades to a bare Class::Method key
+    return chain.targetClass + "::" + chain.targetMethod + chain.signature;
+}
+
+void HookManager::EnsureBakeQuarantineLoaded() {
+    if (m_quarantineLoaded) return;
+    m_quarantineLoaded = true; // mark first: a read failure shouldn't retry every chain
+
+    std::ifstream in(BakeQuarantineFilePath().c_str());
+    if (!in) return; // no file => nothing quarantined (the common case)
+
+    int refused = 0;
+    std::string line;
+    while (std::getline(in, line)) {
+        // Strip an inline " # reason" comment and trim trailing whitespace/CR
+        size_t hash = line.find(" #");
+        if (hash != std::string::npos) line.erase(hash);
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        size_t start = line.find_first_not_of(" \t");
+        if (start == std::string::npos || line[start] == '#') continue; // blank or whole-line comment
+        // Append-only: each line is one attributed crash, so a repeated key accumulates its count
+        int count = ++m_bakeQuarantine[line.substr(start)];
+        if (count == kBakeQuarantineThreshold) ++refused; // crossed the threshold on this entry
+    }
+    if (refused > 0) {
+        LOG_WARN("[HookManager] " + std::to_string(refused) + " baked target(s) reached the crash-quarantine threshold (" + std::to_string(kBakeQuarantineThreshold) +
+                 " strikes); they will NOT bake this run (typed hooks run boxed instead). Delete baked_quarantine.txt to retry.");
+    } else if (!m_bakeQuarantine.empty()) {
+        LOG_INFO("[HookManager] " + std::to_string(m_bakeQuarantine.size()) + " baked target(s) have prior crash strikes (below the quarantine threshold); still baking this run");
+    }
+}
+
+bool HookManager::IsBakeQuarantined(const HookChain& chain) {
+    EnsureBakeQuarantineLoaded();
+    if (m_bakeQuarantine.empty()) return false;
+    auto it = m_bakeQuarantine.find(BakeQuarantineKey(chain));
+    return it != m_bakeQuarantine.end() && it->second >= kBakeQuarantineThreshold;
+}
+
+static std::wstring BakedCrashLogPath() {
+    return ConfigPaths::GetS3MMDirectory() + L"baked_crashes.log";
+}
+
+// CRASH-TIME FILE WRITES (post-AV / VEH context) - allocation-free and lock-free end to end
+// Handles are pre-opened in a HEALTHY context (the first baked-chain install); records are snprintf-formatted into fixed stack buffers and written with a single WriteFile
+// No CRT heap and no stdio locks, so a crash that fired while the faulting thread HELD the CRT heap lock can't deadlock the logging
+static HANDLE s_quarantineFile = INVALID_HANDLE_VALUE;
+static HANDLE s_crashLogFile = INVALID_HANDLE_VALUE;
+
+static HANDLE OpenAppendHandle(const std::wstring& path) {
+    // FILE_APPEND_DATA => every write lands at EOF (append-only logs)
+    return CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+}
+
+// Called from a healthy context when the first baked chain goes live, so the VEH path never has to CreateFile
+static void EnsureCrashLogHandles() {
+    if (s_quarantineFile == INVALID_HANDLE_VALUE) s_quarantineFile = OpenAppendHandle(BakeQuarantineFilePath());
+    if (s_crashLogFile == INVALID_HANDLE_VALUE) s_crashLogFile = OpenAppendHandle(BakedCrashLogPath());
+}
+
+// One allocation-free append; false when the handle was never opened (no baked chain ever went live, or the open failed)
+static bool CrashAppend(HANDLE h, const char* text, size_t len) {
+    if (h == INVALID_HANDLE_VALUE || !text || len == 0) return false;
+    DWORD written = 0;
+    return WriteFile(h, text, (DWORD)len, &written, nullptr) && written == len;
+}
+
+bool HookManager::QuarantineBakedChain(void* method, const char* reason) {
+    auto* chain = GetChain(method);
+    if (!chain || !chain->bakedActive) return false; // not an active baked target -> not the culprit frame
+
+    // POST-AV CONTEXT - the key is formatted straight into a stack buffer (exact "Class::Method(sig)" layout the loader parses); .c_str() only READS strings built in a healthy context
+    char key[512];
+    _snprintf_s(key, sizeof(key), _TRUNCATE, "%s::%s%s", chain->targetClass.c_str(), chain->targetMethod.c_str(), chain->signature.c_str());
+    key[sizeof(key) - 1] = '\0';
+
+    // APPEND one crash record - a single allocation-free WriteFile; the per-key count is tallied from the file on next launch (the in-memory map is NOT updated - a std::string key allocates, and this process is on its way down)
+    char line[768];
+    int n = _snprintf_s(line, sizeof(line), _TRUNCATE, "%s%s%s\n", key, (reason && reason[0]) ? " # " : "", (reason && reason[0]) ? reason : "");
+    size_t len = (n >= 0) ? (size_t)n : sizeof(line) - 1;
+    if (!CrashAppend(s_quarantineFile, line, len)) { LOG_ERROR("[HookManager] Could not record a quarantine strike for " + std::string(key) + " (crash-log handle not open)"); }
+
+    LOG_ERROR("[HookManager] Crash attributed to baked chain: " + std::string(key) + (reason ? std::string(" (") + reason + ")" : "") + ". Strike recorded; the bake is refused once it reaches " +
+              std::to_string(kBakeQuarantineThreshold) + " strike(s).");
+    return true;
+}
+
+// BAKED CRASH FORENSICS - typed record of a baked-chain fault (see header)
+// Everything below runs in a post-AV context under the VEH caller's __try: readability-guard every deref; file output ONLY via the allocation-free CrashAppend path
+
+// "Namespace.Class @ 0xPTR" for a managed object pointer; "null" / "?unreadable" when it isn't one - writes into the caller's buffer (no heap)
+static void DescribeManagedObject(const void* obj, char* buf, size_t bufSize) {
+    if (!obj) {
+        _snprintf_s(buf, bufSize, _TRUNCATE, "null");
+        return;
+    }
+    if (!IsReadablePointer(const_cast<void*>(obj), 8)) {
+        _snprintf_s(buf, bufSize, _TRUNCATE, "?unreadable @ 0x%08X", (unsigned)(uintptr_t)obj);
+        return;
+    }
+    void* klass = MonoBridge::GetObjectClass(const_cast<void*>(obj));
+    const char* cn = klass ? MonoBridge::GetClassName(klass) : nullptr;
+    const char* ns = klass ? MonoBridge::GetClassNamespace(klass) : nullptr;
+    if (!cn || !IsReadablePointer((void*)cn, 2)) cn = "?";
+    if (!ns || !IsReadablePointer((void*)ns, 2)) ns = "";
+    _snprintf_s(buf, bufSize, _TRUNCATE, "%s%s%s @ 0x%08X", ns, (ns[0] ? "." : ""), cn, (unsigned)(uintptr_t)obj);
+}
+
+// Render one argument's value storage (at `p`, inside the frame args buffer) by its cached type code
+// By-ref params store a managed pointer regardless of pointee; ValueType payloads print as leading hex (size unknown from the cache)
+static void DescribeArgValue(const uint8_t* p, MonoTypeCode code, bool isByRef, char* buf, size_t bufSize) {
+    if (isByRef) {
+        _snprintf_s(buf, bufSize, _TRUNCATE, "byref -> 0x%08X", *(const uint32_t*)p);
+        return;
+    }
+    switch (code) {
+    case MonoTypeCode::Boolean:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "bool = %s", *p ? "true" : "false");
+        break;
+    case MonoTypeCode::I1:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "i1 = %d", (int)*(const int8_t*)p);
+        break;
+    case MonoTypeCode::U1:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "u1 = %u", (unsigned)*p);
+        break;
+    case MonoTypeCode::Char:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "char = 0x%04X", (unsigned)*(const uint16_t*)p);
+        break;
+    case MonoTypeCode::I2:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "i2 = %d", (int)*(const int16_t*)p);
+        break;
+    case MonoTypeCode::U2:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "u2 = %u", (unsigned)*(const uint16_t*)p);
+        break;
+    case MonoTypeCode::I4:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "i4 = %d (0x%X)", *(const int32_t*)p, *(const uint32_t*)p);
+        break;
+    case MonoTypeCode::U4:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "u4 = %u (0x%X)", *(const uint32_t*)p, *(const uint32_t*)p);
+        break;
+    case MonoTypeCode::I8:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "i8 = %lld", (long long)*(const int64_t*)p);
+        break;
+    case MonoTypeCode::U8:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "u8 = %llu", (unsigned long long)*(const uint64_t*)p);
+        break;
+    case MonoTypeCode::R4:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "r4 = %g", (double)*(const float*)p);
+        break;
+    case MonoTypeCode::R8:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "r8 = %g", *(const double*)p);
+        break;
+    case MonoTypeCode::ValueType:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "VT = %02X %02X %02X %02X %02X %02X %02X %02X ...", p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
+        break;
+    case MonoTypeCode::String:
+    case MonoTypeCode::Class:
+    case MonoTypeCode::Object:
+    case MonoTypeCode::SzArray:
+    case MonoTypeCode::GenericInst:
+        DescribeManagedObject(*(void* const*)p, buf, bufSize);
+        return;
+    default:
+        _snprintf_s(buf, bufSize, _TRUNCATE, "?type(0x%02X) raw 0x%08X", (unsigned)code, *(const uint32_t*)p);
+        break;
+    }
+}
+
+void HookManager::DumpBakedCrashRecord(void* method, void* frameV, const char* reason) {
+    auto* chain = GetChain(method);
+    if (!chain || !chain->bakedActive) return;
+    auto* frame = reinterpret_cast<InterpFrame*>(frameV);
+    if (!IsReadablePointer(frame, sizeof(InterpFrame))) return;
+
+    // POST-AV CONTEXT - build the record in a fixed stack buffer (snprintf-append, NO heap), then one WriteFile via the pre-opened handle
+    char rec[16384];
+    size_t off = 0;
+    auto addf = [&rec, &off](const char* fmt, ...) {
+        if (off >= sizeof(rec)) return;
+        va_list ap;
+        va_start(ap, fmt);
+        int n = _vsnprintf_s(rec + off, sizeof(rec) - off, _TRUNCATE, fmt, ap);
+        va_end(ap);
+        off += (n >= 0) ? (size_t)n : (sizeof(rec) - off - 1);
+    };
+    auto adds = [&rec, &off](const char* s) {
+        size_t n = strlen(s);
+        if (off + n >= sizeof(rec)) n = sizeof(rec) - 1 - off;
+        memcpy(rec + off, s, n);
+        off += n;
+    };
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char line[256];
+    addf("=== baked crash %04u-%02u-%02u %02u:%02u:%02u ===\n", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    addf("target : %s::%s\n", chain->targetClass.c_str(), chain->targetMethod.c_str());
+    addf("reason : %s\n", (reason && reason[0]) ? reason : "(none)");
+
+    // FAULTING LINK - match the frame's runtime_method against the compiled chain
+    // Post-recompile, link 0 executes as the in-place-overwritten headRTM (links[0].linkRTM is the staged copy); a frame matching trampolineRTM means the fault was in the ORIGINAL body, not a hook
+    RuntimeMethod* rtm = frame->runtime_method;
+    auto it = m_compiledChains.find(chain->originalMethod);
+    if (it != m_compiledChains.end()) {
+        CompiledChain& c = it->second;
+        adds("chain  : ");
+        for (size_t i = 0; i < c.links.size(); ++i) { addf("[%u %s %s] ", (unsigned)i, c.links[i].kind == LinkKind::ShimHook ? "shim" : "typed", c.links[i].modName.c_str()); }
+        addf("(v%u)\n", c.version);
+
+        const char* blame = "?unmatched RTM";
+        if (rtm == c.trampolineRTM) {
+            blame = "trampoline (original method body)";
+        } else {
+            for (size_t i = 0; i < c.links.size(); ++i) {
+                if (rtm == c.links[i].linkRTM || (i == 0 && rtm == c.headRTM)) {
+                    _snprintf_s(line, sizeof(line), _TRUNCATE, "link %u (%s, %s)", (unsigned)i, c.links[i].kind == LinkKind::ShimHook ? "shim" : "typed", c.links[i].modName.c_str());
+                    blame = line;
+                    break;
+                }
+            }
+        }
+        addf("frame  : %s\n", blame);
+    }
+
+    // IP - byte offset into the faulting RTM's bytecode
+    if (IsReadablePointer(rtm, sizeof(RuntimeMethod)) && IsValidPointer(rtm->code) && frame->ip && (uintptr_t)frame->ip >= (uintptr_t)rtm->code) {
+        addf("ip     : 0x%08X (code+0x%X)\n", (unsigned)(uintptr_t)frame->ip, (unsigned)((uintptr_t)frame->ip - (uintptr_t)rtm->code));
+    }
+
+    // THIS + TYPED ARGS - `this` lives at frame->obj (+0x0C), NOT in the args buffer; arg_offsets[i] is explicit param i on instance and static targets alike
+    if (chain->originalIsInstance) {
+        DescribeManagedObject(frame->obj, line, sizeof(line));
+        addf("this   : %s\n", line);
+    }
+
+    uint16_t nParams = chain->signatureCached ? chain->cachedParamCount : 0;
+    bool rtmReadable = IsReadablePointer(rtm, sizeof(RuntimeMethod));
+    if (rtmReadable && rtm->param_count < nParams) nParams = rtm->param_count; // trust the smaller claim
+    const uint8_t* argsBuf = reinterpret_cast<const uint8_t*>(frame->args);
+    uint16_t argsSize = rtmReadable ? rtm->args_size : 0;
+    bool argsReadable = argsBuf && argsSize > 0 && IsReadablePointer(const_cast<uint8_t*>(argsBuf), argsSize);
+    bool offsetsReadable = rtmReadable && nParams > 0 && IsReadablePointer(rtm->arg_offsets, nParams * sizeof(uint32_t));
+
+    if (argsReadable && offsetsReadable) {
+        for (uint16_t i = 0; i < nParams; ++i) {
+            uint32_t argOff = rtm->arg_offsets[i];
+            if (argOff + 8 > argsSize) { // slot must fit inside the arg area (8 = widest primitive read)
+                addf("arg[%u] : ?offset 0x%X outside args_size 0x%X\n", (unsigned)i, argOff, (unsigned)argsSize);
+                continue;
+            }
+            DescribeArgValue(argsBuf + argOff, chain->cachedParamTypes[i], chain->cachedParamIsByRef[i], line, sizeof(line));
+            addf("arg[%u] : %s\n", (unsigned)i, line);
+        }
+    }
+
+    // RAW ARGS BUFFER - ground truth if the typed decode is ever suspect; capped at 64 bytes
+    if (argsReadable) {
+        uint16_t dump = argsSize < 64 ? argsSize : 64;
+        adds("raw    : ");
+        for (uint16_t i = 0; i < dump; ++i) { addf("%02X ", argsBuf[i]); }
+        if (dump < argsSize) adds("...");
+        adds("\n");
+    }
+
+    // One allocation-free WriteFile via the pre-opened handle; the buffer stays stack-resident throughout
+    if (!CrashAppend(s_crashLogFile, rec, off)) {
+        rec[off] = '\0';
+        LOG_ERROR("[HookManager] Could not append to baked_crashes.log (crash-log handle not open); record follows:\n" + std::string(rec, off));
+    }
+}
+
+// ELIGIBILITY - the typed path requires a structurally-identical call all the way down: every entry must ExactMatch the target signature
+// INSTANCE targets bake via the leading-self convention (see hook_manager.h); value-type (struct) receivers are refused inside CompileChain (object-self can't carry a struct's by-ref this)
+bool HookManager::ChainBakeEligible(HookChain& chain) {
+    if (chain.hooks.empty()) return false;
+
+    // INTERPRETER INTEGRITY: the interp_exec_state recovery-site bytes must match this build - baked dispatch and the VEH crash-quarantine assume a pristine interpreter, else fall back to boxing
+    // Live read-only probe (not a startup snapshot) so a late-installing patcher is still caught; typed entries get demoted (they run boxed, not dropped)
+    if (!ExceptionHook::InterpRecoverySignatureIntact(Addresses::Methods.interp_exec_state)) {
+        LOG_WARN("[HookManager] Bake refused (interpreter recovery signature mismatch): " + chain.targetClass + "::" + chain.targetMethod);
+        return false;
+    }
+
+    // CRASH QUARANTINE: a target with >= kBakeQuarantineThreshold attributed crashes is refused; typed entries demote to boxing (delete baked_quarantine.txt to clear)
+    if (IsBakeQuarantined(chain)) {
+        LOG_WARN("[HookManager] Bake refused (reached crash-quarantine threshold): " + chain.targetClass + "::" + chain.targetMethod);
+        return false;
+    }
+
+    // INFLATED TARGET: boxing dispatch only - the baked recipe re-signs link clones under the target's signature, and the context-sensitive transform path isn't proven for an inflated signature
+    // Typed hooks demote to boxing instead of risking a bad bake
+    if (chain.originalMethod && (reinterpret_cast<MonoMethodLayout*>(chain.originalMethod)->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG)) {
+        LOG_DEBUG("[HookManager] Bake skipped (inflated generic target - boxing dispatch only): " + chain.targetClass + "::" + chain.targetMethod);
+        return false;
+    }
+
+    // The add_data_item instrument must be live or no link would ever capture its CallNext slots (every typed link would silently become replace-only); fall back rather than mis-dispatch
+    if (!ChainCompiler::Get().IsInstalled()) {
+        LOG_DEBUG("[HookManager] Bake skipped (instrument not installed): " + chain.targetClass + "::" + chain.targetMethod);
+        return false;
+    }
+
+    SignatureInfo target = ChainCompiler::ReadSignature(chain.originalMethod);
+    if (!target.valid) return false;
+
+    // MIXED CHAINS bake: a boxing/watcher hook (usesChain=false) rides as a ShimHook link, continued through ContinueBakedChain - two requirements remain:
+    //   - EVERY entry must ExactMatch the target: a shim link is entered with RAW arg slots (not boxed), so a loosely-typed boxing handler can't ride baked
+    //   - At least ONE entry must forward via Chain.* (usesChain): an all-boxing chain gains nothing from baking and stays on the cheaper dispatch stub
+    bool anyChain = false;
+    for (const HookEntry& e : chain.hooks) {
+        if (e.hasWrapper) return false; // generated dispatch wrapper - an instance-path artifact, not a bakeable link
+        if (e.usesChain) anyChain = true;
+        SignatureInfo h = ChainCompiler::ReadSignature(e.hookMethod);
+        if (!h.ExactMatch(target)) {
+            // Ineligible: the attributed log line is emitted by DemoteIneligibleTypedHooks (the caller routes here on a false return)
+            // Keep the structural dump at DEBUG for diagnosis
+            LOG_DEBUG("[HookManager]   " + DumpSig("target", target));
+            LOG_DEBUG("[HookManager]   " + DumpSig("hook  ", h));
+            return false;
+        }
+    }
+    return anyChain;
+}
+
+// UNBAKEABLE CHAIN - demote-or-reject (see hook_manager.h): a boxing-safe Chain.* entry is KEPT and runs boxed
+// A DEFECTIVE entry (signature mismatch, incoherent Chain.CallNext forward, Chain.ByRef) breaks both paths - reject it with an install-time error rather than box it into per-call runtime spam
+// First reason -> bakeRejectReason (Audit.GetBakeRejectReason)
+void HookManager::DemoteIneligibleTypedHooks(HookChain& chain) {
+    bool anyChain = false;
+    for (const HookEntry& e : chain.hooks) {
+        if (e.usesChain) {
+            anyChain = true;
+            break;
+        }
+    }
+    if (!anyChain) return; // pure boxing chain - never attempted a bake, nothing to explain
+
+    SignatureInfo target = ChainCompiler::ReadSignature(chain.originalMethod);
+
+    // The external-block reason (used only when the hook is itself boxing-safe): why couldn't the CHAIN bake?
+    // Mixed chains bake, so the blocker is a sibling whose signature doesn't ExactMatch, quarantine, a downed instrument, or a compile/install failure
+    auto externalReason = [&]() -> std::string {
+        if (!ExceptionHook::InterpRecoverySignatureIntact(Addresses::Methods.interp_exec_state))
+            return "the game's script interpreter doesn't match this build (another native patcher is present, or a game build mismatch), so S3MM disabled baking for safety and runs this hook boxed";
+        if (IsBakeQuarantined(chain)) return "crashes on previous runs were attributed to this baked target (reached the quarantine threshold); delete baked_quarantine.txt to retry";
+        if (!ChainCompiler::Get().IsInstalled()) return "baked-dispatch instrument unavailable";
+        for (const HookEntry& o : chain.hooks) {
+            SignatureInfo oh = ChainCompiler::ReadSignature(o.hookMethod);
+            if (!target.valid || !oh.ExactMatch(target)) { return "another hook on this method (mod '" + o.modName + "') doesn't exactly match the target signature, so the whole chain can't bake"; }
+        }
+        // TryInstallBakedChain seeds bakeRejectReason with CompileChain's specific failure - prefer it
+        return chain.bakeRejectReason.empty() ? "the baked chain could not be compiled or installed (see preceding warnings)" : chain.bakeRejectReason;
+    };
+
+    std::vector<void*> rejected;
+    for (HookEntry& e : chain.hooks) {
+        if (!e.usesChain) continue; // boxing/replacement hook - runs boxed as written, no message needed
+
+        // Reject a DEFECT (breaks bake AND box); box a boxing-safe hook that was only blocked externally
+        SignatureInfo h = ChainCompiler::ReadSignature(e.hookMethod);
+        std::string defect, fwdReason;
+        if (!target.valid) {
+            defect = "could not read the target method signature";
+        } else if (!h.ExactMatch(target)) {
+            defect = "handler signature does not exactly match the target - " + DescribeSigMismatch(target, h);
+        } else if (!ChainCompiler::VerifyHookForward(e.hookMethod, target, target.hasThis, fwdReason)) {
+            defect = "incoherent Chain.CallNext forward (" + fwdReason + ") - can neither bake nor box";
+        } else if (ChainCompiler::HookUsesByRef(e.hookMethod)) {
+            defect = "Chain.ByRef can't fall back to boxing (ref/out forwarding only works on the baked path)";
+        }
+
+        std::string reason = defect.empty() ? externalReason() : defect;
+        if (chain.bakeRejectReason.empty()) chain.bakeRejectReason = reason; // surfaced via Audit.GetBakeRejectReason
+
+        if (!defect.empty()) {
+            LOG_ERROR(
+                "[HookManager] Chain hook REJECTED (" + reason + "): " + chain.targetClass + "::" + chain.targetMethod + " <- mod '" + e.modName + "'. Fix the handler, or use the boxing Hook.CallNext / Hook.Ref API.");
+            rejected.push_back(e.hookMethod);
+        } else {
+            LOG_WARN("[HookManager] Chain hook not baked, running BOXED (" + reason + "): " + chain.targetClass + "::" + chain.targetMethod + " <- mod '" + e.modName + "'.");
+        }
+    }
+
+    if (rejected.empty()) return;
+    auto isRejected = [&](const HookEntry& e) { return std::find(rejected.begin(), rejected.end(), e.hookMethod) != rejected.end(); };
+    chain.hooks.erase(std::remove_if(chain.hooks.begin(), chain.hooks.end(), isRejected), chain.hooks.end());
+    chain.watchers.erase(std::remove_if(chain.watchers.begin(), chain.watchers.end(), isRejected), chain.watchers.end());
+}
+
+// BUILD - populate links from the priority-sorted hook list and ensure the trampoline RTM exists
+bool HookManager::BuildCompiledChain(HookChain& chain, CompiledChain& c) {
+    c.targetMethod = chain.originalMethod;
+
+    // Tail target = the original IL: trampolineMethod is a BackupOriginalMethod copy (cleared RTM, original token/klass); transform it into an RTM that runs the original body with original identity
+    auto* trampoline = reinterpret_cast<MonoMethodLayout*>(chain.trampolineMethod);
+    if (!trampoline) {
+        LOG_ERROR("[HookManager] BuildCompiledChain: no trampoline method");
+        return false;
+    }
+    if (!trampoline->runtimeMethod) {
+        MonoBridge::Get().SetupTLS();
+        if (!MonoBridge::Get().TransformMethod(chain.trampolineMethod)) {
+            LOG_ERROR("[HookManager] BuildCompiledChain: failed to transform trampoline (original IL)");
+            return false;
+        }
+    }
+    c.trampolineRTM = trampoline->runtimeMethod;
+    if (!c.trampolineRTM) {
+        LOG_ERROR("[HookManager] BuildCompiledChain: null trampoline RTM after transform");
+        return false;
+    }
+
+    // One typed link per chain entry, in execution order (watchers merged in by priority already)
+    c.links.clear();
+    c.links.reserve(chain.hooks.size());
+    for (const HookEntry& e : chain.hooks) {
+        ChainLink link;
+        // usesChain forwards via S3MM.Chain.* (baked slot); a boxing/watcher handler rides as a ShimHook link (see hook_manager.h)
+        link.kind = e.usesChain ? LinkKind::TypedHook : LinkKind::ShimHook;
+        link.modName = e.modName;
+        link.userMethod = e.hookMethod;
+        c.links.push_back(std::move(link));
+    }
+    return true;
+}
+
+// FIRST INSTALL - compile then transplant the head RTM onto the target
+bool HookManager::TryInstallBakedChain(HookChain& chain) {
+    CompiledChain c;
+    if (!BuildCompiledChain(chain, c)) return false;
+
+    if (!ChainCompiler::Get().CompileChain(c)) {
+        // Seed the specific compile failure for Audit.GetBakeRejectReason; DemoteIneligibleTypedHooks keeps the first non-empty reason and its externalReason() falls back to this over the generic message
+        chain.bakeRejectReason = c.failReason.empty() ? "the baked chain could not be compiled (see preceding warnings)" : c.failReason;
+        LOG_WARN("[HookManager] Baked compile failed, falling back to boxing: " + chain.targetClass + "::" + chain.targetMethod);
+        return false;
+    }
+    if (!ChainCompiler::Get().InstallChain(c)) {
+        chain.bakeRejectReason = "the baked chain compiled but could not be installed (see preceding warnings)";
+        LOG_WARN("[HookManager] Baked install failed, falling back to boxing: " + chain.targetClass + "::" + chain.targetMethod);
+        return false;
+    }
+
+    m_compiledChains[chain.originalMethod] = std::move(c);
+    chain.bakedActive = true;
+    EnsureCrashLogHandles();        // pre-open the quarantine/crash-log files in a HEALTHY context so the VEH crash path never CreateFiles
+    chain.bakeRejectReason.clear(); // baked cleanly - drop any stale reason from a prior failed attempt
+    chain.isPatched = true;
+    LOG_INFO("[HookManager] Installed baked chain: " + chain.targetClass + "::" + chain.targetMethod + " (" + std::to_string(chain.hooks.size()) + " links)");
+    return true;
+}
+
+// RECOMPILE - rebuild links and re-install IN PLACE (preserve headRTM so game-cached pointers stay live)
+bool HookManager::RecompileBakedChain(HookChain& chain) {
+    // A runtime registration may have added an incompatible hook since the bake; rebuilding would compile a corrupt dispatch, so keep the old chain
+    if (!ChainBakeEligible(chain)) {
+        LOG_ERROR("[HookManager] Cannot recompile baked chain - a newly added hook made it ineligible "
+                  "(incompatible signature, boxing hook, or instance target). Keeping the previous baked "
+                  "chain: " +
+                  chain.targetClass + "::" + chain.targetMethod);
+        return false;
+    }
+
+    auto it = m_compiledChains.find(chain.originalMethod);
+    if (it == m_compiledChains.end()) {
+        // Lost the compiled record (shouldn't happen) - treat as first install
+        return TryInstallBakedChain(chain);
+    }
+    // STAGE AND COMMIT - build/compile into a temp so a FAILED recompile leaves the live record untouched (the target still executes the old head, and the map's linkRTMs still match what frames execute)
+    void* headRTM = it->second.headRTM;
+    CompiledChain staged;
+    staged.headRTM = headRTM; // non-null -> InstallChain overwrites this RTM's CONTENTS in place (game-cached pointers stay live)
+    staged.version = it->second.version;
+    if (!BuildCompiledChain(chain, staged)) return false;
+
+    if (!ChainCompiler::Get().CompileChain(staged)) return false;
+    if (!ChainCompiler::Get().InstallChain(staged)) return false;
+    it->second = std::move(staged); // commit only on success
+    return true;
+}
+
+// Forward declaration - defined below, near the boxing dispatch path it shares with NativeCallNext
+static std::vector<void*> UnboxParametersFast(void* argsArray, const HookChain* chain);
+
+// FIND CALLER BAKED LINK - frame-walk to the innermost link RTM of originalMethod's baked chain
+// A ShimHook link's clone RTM is the current interpreter frame's runtime_method when its handler calls Hook.CallNext (the ICALL runs native, so the frame is still the link's), so a shallow walk resolves it
+int HookManager::FindCallerBakedLinkIndex(void* originalMethod) {
+    auto compIt = m_compiledChains.find(originalMethod);
+    if (compIt == m_compiledChains.end()) return -1;
+    CompiledChain& c = compIt->second;
+
+    DWORD tlsIndex = *(DWORD*)Addresses::Profiler.g_thread_context_tls_index;
+    void* ctx = TlsGetValue(tlsIndex);
+    if (!ctx) return -1;
+
+    InterpFrame* current = reinterpret_cast<ThreadContext*>(ctx)->current_frame;
+    int frameCount = 0;
+    while (current && frameCount < 10) { // innermost-first; safety-limited like NativeGetCallerHookToken
+        RuntimeMethod* rtm = current->runtime_method;
+        if (rtm) {
+            for (size_t i = 0; i < c.links.size(); ++i) {
+                // Post-recompile, link 0 executes as the in-place-overwritten headRTM (links[0].linkRTM holds the staged copy) - same special case as DumpBakedCrashRecord
+                if (c.links[i].linkRTM == rtm || (i == 0 && rtm == c.headRTM)) return static_cast<int>(i);
+            }
+        }
+        current = current->parent;
+        frameCount++;
+    }
+    return -1;
+}
+
+// CONTINUE BAKED CHAIN - a ShimHook link's boxing Hook.CallNext lands here via NativeCallNext (see hook_manager.h)
+void* HookManager::ContinueBakedChain(void* originalMethod, size_t fromLinkIndex, void* thisPtr, void* argsArray) {
+    auto compIt = m_compiledChains.find(originalMethod);
+    if (compIt == m_compiledChains.end()) {
+        LOG_ERROR("[HookManager] ContinueBakedChain: no compiled chain for method");
+        return nullptr;
+    }
+    CompiledChain& c = compIt->second;
+    HookChain* chain = GetChain(originalMethod);
+
+    std::vector<void*> unboxedParams = UnboxParametersFast(argsArray, chain);
+    void** params = unboxedParams.empty() ? nullptr : unboxedParams.data();
+
+    size_t next = fromLinkIndex + 1;
+    if (next >= c.links.size()) {
+        // Past the last link - fall through to the true original (trampoline)
+        return InvokeOriginal(originalMethod, thisPtr, params);
+    }
+
+    void* nextMethod = c.links[next].linkMethod; // clone whose runtimeMethod == linkRTM (baked slots wired)
+    if (!nextMethod) {
+        LOG_ERROR("[HookManager] ContinueBakedChain: link " + std::to_string(next) + " has no clone method");
+        return nullptr;
+    }
+
+    // Instance chains: linkMethod was re-signed instance (STATIC cleared), so runtime-invoke delivers thisPtr as the receiver - the leading-self convention
+    MonoBridge::Get().SetupTLS();
+    MonoInvokeState st = {};
+    bool ok = MonoBridge::Get().InvokeMethod(nextMethod, thisPtr, params, &st);
+    if (!ok) {
+        std::string excMsg = ExtractExceptionInfo(st.pThrowExc);
+        LOG_ERROR("[HookManager] ContinueBakedChain: exception in link " + std::to_string(next) + " (" + c.links[next].modName + ") for " + (chain ? chain->targetClass + "::" + chain->targetMethod : std::string("?")) +
+                  ": " + excMsg);
+        if (chain) { ModLog::Get().Log(c.links[next].modName, "EXCEPTION in " + chain->targetClass + "::" + chain->targetMethod + ": " + excMsg, LogLevel::Error); }
+    }
+
+    // Boxed result out (see header) - a value-type-returning link must not hand managed Hook.CallNext a raw stackval pointer
+    return BoxInvokeResult(chain, st, "ContinueBakedChain");
 }
 
 // INVOKE ORIGINAL - Call the trampoline to execute unhooked original IL
@@ -1125,27 +1988,47 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
         CacheSignatureInfo(*chain);
     }
 
-    MonoTypeCode typeCode = chain->cachedReturnType;
+    return BoxInvokeResult(chain, state, "InvokeOriginal");
+}
 
-    // Enhanced diagnostics for return value handling
-    LOG_DEBUG("[HookManager] InvokeOriginal: typeCode=" + std::to_string((int)typeCode) + ", isObject=" + std::to_string(state.isObject) + ", pRet=" + std::to_string((uintptr_t)state.pRet) +
-              ", pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
+// SHARED RETURN TERMINAL - see hook_manager.h; every boxing return path funnels through here
+void* HookManager::BoxInvokeResult(HookChain* chain, MonoInvokeState& state, const char* site) {
+    const std::string tag = std::string("[HookManager] ") + (site ? site : "?") + ": ";
+    MonoTypeCode typeCode = chain ? chain->cachedReturnType : MonoTypeCode::Object;
+
+    LOG_DEBUG(
+        tag + "typeCode=" + std::to_string((int)typeCode) + ", isObject=" + std::to_string(state.isObject) + ", pRet=" + std::to_string((uintptr_t)state.pRet) + ", pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
 
     // FAST PATH: void return - nothing to return
-    if (chain->returnIsVoid) { return nullptr; }
+    if (chain && chain->returnIsVoid) { return nullptr; }
 
     // Use isObject as the authoritative check for where the return value lives.
     // The interpreter sets isObject=1 for reference types, isObject=0 for value types.
     // This is more reliable than type code matching, especially for private nested classes, generic instantiations, and edge cases in type resolution.
     if (state.isObject) {
-        LOG_DEBUG("[HookManager] InvokeOriginal: isObject=1, returning pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
+        LOG_DEBUG(tag + "isObject=1, returning pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
         return state.pRetVal;
     }
 
     // Diagnostic: isObject should be authoritative, but warn if typeCode disagrees
-    if (typeCode == MonoTypeCode::Class || typeCode == MonoTypeCode::Object || typeCode == MonoTypeCode::String || typeCode == MonoTypeCode::SzArray || typeCode == MonoTypeCode::GenericInst) {
-        LOG_WARN("[HookManager] InvokeOriginal: isObject=0 but typeCode=" + std::to_string((int)typeCode) + " suggests reference type. " + "pRetVal=" + std::to_string((uintptr_t)state.pRetVal) +
-                 ", pRet=" + std::to_string((uintptr_t)state.pRet));
+    if (typeCode == MonoTypeCode::Class || typeCode == MonoTypeCode::Object || typeCode == MonoTypeCode::String || typeCode == MonoTypeCode::SzArray) {
+        LOG_WARN(tag + "isObject=0 but typeCode=" + std::to_string((int)typeCode) + " suggests reference type. " + "pRetVal=" + std::to_string((uintptr_t)state.pRetVal) + ", pRet=" + std::to_string((uintptr_t)state.pRet));
+    }
+
+    // VALUE-TYPE RETURN, PRE-BOXED BY THE RUNTIME - the invoke setup pre-allocates the box and points pRet at its payload (box+0x4)
+    // => pRetVal is the authoritative, already-filled boxed result, re-boxing from pRet is wrong for >8-byte structs
+    if (state.pRetVal) {
+        LOG_DEBUG(tag + "value-type return: using the runtime's pre-boxed pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
+        return state.pRetVal;
+    }
+
+    // FALLBACK - pRetVal null means the runtime didn't pre-box (e.g. a retried invoke with a partially-cleared state) box manually where safe
+    LOG_WARN(tag + "pRetVal is null on a value-type return (setup helper didn't pre-box?) - falling back to manual boxing from pRet");
+
+    // Without a chain we cannot name the value's class, so there is nothing safe to box, the raw pRet is a stackval pointer, NOT an object, and handing it back is exactly the pointer-shaped-garbage bug this helper exists to prevent
+    if (!chain) {
+        LOG_WARN(tag + "value-type return with no chain context - cannot determine return class, returning null rather than a raw stackval pointer");
+        return nullptr;
     }
 
     // For value types (int, bool, float, etc.), we need to box the value. Use cached klass if available, otherwise look up from mono_defaults.
@@ -1154,30 +2037,31 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
         // For primitive types, look up the class from mono_defaults (cached at known addresses in the Sims 3 executable).
         valueKlass = GetPrimitiveKlass(typeCode);
         if (!valueKlass) {
-            LOG_WARN("[HookManager] InvokeOriginal: unknown primitive type " + std::to_string((int)typeCode));
-            return state.pRet;
+            LOG_WARN(tag + "unknown primitive type " + std::to_string((int)typeCode) + " - returning null rather than a raw stackval pointer");
+            return nullptr;
         }
         // Cache it for next time
         chain->cachedReturnKlass = valueKlass;
-        LOG_DEBUG("[HookManager] InvokeOriginal: cached primitive klass=" + std::to_string((uintptr_t)valueKlass));
+        LOG_DEBUG(tag + "cached primitive klass=" + std::to_string((uintptr_t)valueKlass));
     }
 
     // pRet points to the raw value bytes
     if (!state.pRet) {
-        LOG_WARN("[HookManager] InvokeOriginal: pRet is null for value type");
+        LOG_WARN(tag + "pRet is null for value type");
         return nullptr;
     }
 
-    // Box the value using pRet (where the actual value is stored)
-    void* boxedValue = MonoBridge::Get().BoxValue(valueKlass, state.pRet);
-    LOG_DEBUG("[HookManager] InvokeOriginal: boxed value = " + std::to_string((uintptr_t)boxedValue));
+    // The stackval-slot size guard applies ONLY to non-primitive value types (structs)
+    // A primitive's payload is <= 8 bytes (one slot), but alignment padding can inflate its boxed instance_size (System.Double: [4 header][4 pad][8 data] = 16, so instance_size-4 = 12 would falsely trip a flat size guard)
+    // The guard is reserved for genuinely wide structs (e.g. a 16-byte ResourceKey), whose payload lives on the interpreter vt side-stack, not in a single slot
+    void* boxedValue = chain->returnIsPrimitive ? MonoBridge::Get().BoxValue(valueKlass, state.pRet) : MonoBridge::Get().BoxValueChecked(valueKlass, state.pRet, MonoBridge::STACKVAL_SLOT_BYTES, site);
+    LOG_DEBUG(tag + "boxed value = " + std::to_string((uintptr_t)boxedValue));
 
     return boxedValue;
 }
 
-// INVOKE BASE - Skip all hooks, same as InvokeOriginal for now
+// INVOKE BASE - Skip all hooks (same as InvokeOriginal)
 void* HookManager::InvokeBase(void* originalMethod, void* thisPtr, void** params) {
-    // Same as InvokeOriginal for now - both skip all hooks
     return InvokeOriginal(originalMethod, thisPtr, params);
 }
 
@@ -1231,13 +2115,12 @@ static std::vector<void*> UnboxParametersFast(void* argsArray, const HookChain* 
             continue;
         }
 
-        // Check for Hook.Ref<T> byref wrapper pattern (runtime check).
-        // This heuristic treats ANY single-element array as a byref wrapper, passing &array[0] instead of the array object.
-        // Hook.Ref<T> has a struct constraint on the managed side to prevent accidental byref treatment of legitimate single-element arrays.
-        // For ref-type byrefs (e.g. ref uint[]), modders must manually create T[1] wrappers.
-        // TODO: Could use a distinct marker type instead of the length-1 heuristic.
+        // Hook.Ref<T> byref wrapper (runtime check): a single-element array passed at a position whose TARGET param is ref/out is the by-ref smuggle - pass &array[0]
+        // GATED on cachedParamIsByRef so a legitimate length-1 array argument to a by-value array param isn't mis-dereffed as a by-ref smuggle (type confusion)
+        // Without cached info fall back to the legacy any-position heuristic; for ref-type byrefs (e.g. ref uint[]) modders still create T[1] wrappers manually
         void* klass = MonoBridge::Get().GetObjectClass(boxedValue);
-        if (klass) {
+        bool byrefPosition = !useCached || chain->cachedParamIsByRef[i];
+        if (klass && byrefPosition) {
             // Quick check: arrays have SzArray type code at offset 0xA6 in class
             uint8_t typeEnum = *(uint8_t*)((uintptr_t)klass + Offsets::CLASS_ELEMENT_TYPE);
             if (typeEnum == (uint8_t)MonoTypeCode::SzArray) {
@@ -1288,6 +2171,17 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
     if (!chain) {
         LOG_ERROR("[HookManager] NativeCallNext: no chain for method");
         return nullptr;
+    }
+
+    // BAKED CHAIN: a ShimHook link forwarding via Hook.CallNext - the chain dispatches through the compiled RTM links, so continue natively from the calling link (see hook_manager.h)
+    if (chain->bakedActive) {
+        int linkIdx = mgr.FindCallerBakedLinkIndex(originalMethod);
+        if (linkIdx >= 0) { return mgr.ContinueBakedChain(originalMethod, static_cast<size_t>(linkIdx), thisPtr, argsArray); }
+        // A baked chain is always entered through one of its links; not finding the caller means the frame walk missed it
+        // Fail safe to the original rather than mis-dispatch through the unused hook list
+        LOG_ERROR("[HookManager] NativeCallNext: baked chain but caller link not found for " + chain->targetClass + "::" + chain->targetMethod + "; invoking original");
+        std::vector<void*> p = UnboxParametersFast(argsArray, chain);
+        return mgr.InvokeOriginal(originalMethod, thisPtr, p.empty() ? nullptr : p.data());
     }
 
     // Check if we have an active chain state for this token
@@ -1487,7 +2381,8 @@ uint32_t __cdecl HookManager::NativeGetCallerHookToken() {
                         LOG_DEBUG("[HookManager] Deferred identity restore complete: " + chainIt->second.targetClass + "::" + chainIt->second.targetMethod);
                     }
                 }
-                return chainIt->second.originalToken;
+                // Return the chain's UNIQUE dispatch token (m_tokenToMethod key), not the raw MethodDef token - a cross-assembly row collision would resolve CallNext to the WRONG chain
+                return chainIt->second.dispatchToken ? chainIt->second.dispatchToken : chainIt->second.originalToken;
             }
 
             // Check if this method is in our hook map (by pointer) - hook[1..N]
@@ -1653,7 +2548,9 @@ void* __cdecl HookManager::NativeDispatch(uint32_t methodToken, void* thisPtr, v
         ModLog::Get().Log(firstHook.modName, "EXCEPTION in " + chain->targetClass + "::" + chain->targetMethod + ": " + excMsg, LogLevel::Error);
     }
 
-    void* result = invokeState.pRetVal ? invokeState.pRetVal : invokeState.pRet;
+    // The invoked method here is the HOOK, not the original, so the value that came back is typed by the hook's signature
+    // A correctly-declared hook returns the target's return type, and mismatches are already demoted by DemoteIneligibleTypedHooks, so the chain's cached return info is the right descriptor - and isObject is consulted first regardless
+    void* result = BoxInvokeResult(chain, invokeState, "NativeDispatch");
 
     // Clean up chain state
     if (!t_chainStack.empty() && t_chainStack.back().methodToken == methodToken) { t_chainStack.pop_back(); }

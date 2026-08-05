@@ -225,6 +225,7 @@ static AddressEntry s_entries[] = {
     ADDR(Methods.interp_exec_state, "55 8B EC B8 ?? ?? ?? ?? E8 ?? ?? ?? ?? A1 ?? ?? ?? ?? 8B 0D ?? ?? ?? ?? 53 8B 5D 08", 0, 0x00E53EB0, false),          // main interpreter dispatch loop (~28KB)
     ADDR(Methods.SPEC_mono_interp_create_runtime_method, "57 8B 7C 24 08 8B 47 14 85 C0 75 ?? 56 E8 ?? ?? ?? ?? 8B 40 18 6A 48 50", 0, 0x00E51F20, false), // RuntimeMethod* create_runtime_method(MonoMethod*), get-or-create
     ADDR(Methods.SPEC_interp_transform_method, "A1 ?? ?? ?? ?? 56 50 33 F6 FF 15 ?? ?? ?? ?? 8B 4C 24 08 F7 41 44 ?? ?? ?? ??", 0, 0x00E52B60, false),     // int transform(RuntimeMethod*) 0 = success
+    ADDR(Methods.SPEC_interp_add_data_item, "8B 46 6C 53 50 E8 ?? ?? ?? ?? 83 C4 08 85 C0 74 04 83 C0 FF C3 8B 4E 64", 0, 0x00E5BCD0, false),              // u16 add_data_item(td=ESI, value=EBX) -> dedup data_items index
 
     // Fields
     ADDR(Fields.mono_field_get_value, "8B 44 24 08 8B 08 F6 41 04 10 74 ?? 68 ?? ?? ?? ?? 68 4B 07 00 00 68", 0, 0x00EA1350, false),

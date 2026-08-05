@@ -64,7 +64,19 @@ constexpr uint32_t FIELD_NAME = 0x0C;
 constexpr uint32_t METHOD_FLAGS = 0x00;
 constexpr uint32_t METHOD_KLASS = 0x08;
 constexpr uint32_t METHOD_SIGNATURE = 0x0C;
+constexpr uint32_t METHOD_GENERIC_CONTAINER = 0x10;
 constexpr uint32_t METHOD_NAME = 0x18;
+constexpr uint32_t METHOD_SLOT_AND_FLAGS = 0x1C;
+
+// is_inflated bit in the packed dword at METHOD_SLOT_AND_FLAGS
+// mono_method_signature branches on it, and only on that branch does it read METHOD_INFLATED_DECLARING as the declaring generic method and recurse into itself
+constexpr uint32_t METHOD_IS_INFLATED_FLAG = 0x400;
+
+// MonoMethodInflated extension - lives past the 0x28 bytes of MonoMethodLayout
+// The inflation path allocates 0x30 bytes: base MonoMethod (0x28) + context (+0x28) + declaring (+0x2C)
+// mono_method_get_context is literally `is_inflated ? *(m+0x28) : 0`
+constexpr uint32_t METHOD_INFLATED_CONTEXT = 0x28;
+constexpr uint32_t METHOD_INFLATED_DECLARING = 0x2C;
 
 // MonoMethodSignature
 constexpr uint32_t SIG_PARAM_COUNT = 0x04;
@@ -80,6 +92,10 @@ constexpr uint32_t ARRAY_BOUNDS = 0x04; // MonoArrayBounds* (null for 1D arrays)
 constexpr uint32_t ARRAY_LENGTH = 0x08; // int32 element count (max_length)
 constexpr uint32_t ARRAY_DATA = 0x10;   // Start of array data (offset 16, after 4-byte padding)
 
+// MonoClass generic instantiation marker - MonoGenericClass*, null for ordinary classes
+// mono_method_signature's non-inflated path asserts this is null, so a method whose declaring class is a generic instantiation has to take the inflated path
+constexpr uint32_t CLASS_GENERIC_CLASS = 0xA8;
+
 // MonoClass size/array-related
 constexpr uint32_t CLASS_INSTANCE_SIZE = 0x54;      // uint32 instance size in bytes
 constexpr uint32_t CLASS_ELEMENT_CLASS = 0x30;      // MonoClass* of element type (for arrays)
@@ -87,6 +103,8 @@ constexpr uint32_t CLASS_ELEMENT_TYPE = 0xA6;       // MonoTypeEnum of element t
 constexpr uint32_t CLASS_ARRAY_ELEMENT_SIZE = 0x5C; // Cached element size for arrays
 
 // MonoType
+// data union - MonoClass* for CLASS and VALUETYPE, the element MonoClass* for SZARRAY, MonoGenericClass* for GENERICINST
+constexpr uint32_t TYPE_DATA = 0x00;
 constexpr uint32_t TYPE_ATTRS = 0x04;
 constexpr uint32_t TYPE_CODE = 0x06;
 
@@ -130,7 +148,7 @@ struct RuntimeMethod {
     uint32_t code_size;      // 0x04: XeX splits this as refcount(1B) + refcount(1B) + code_size(2B). x86 may differ.
     void* method;            // 0x08: Back-pointer to originating MonoMethod*. Matches XeX.
     void* template_method;   // 0x0C: Resolved MonoMethod* for delegation/generic instantiation. Matches XeX.
-    void* func;              // 0x10: ICALL native thunk (set by FUN_00e51400 during transform). Matches XeX.
+    void* func;              // 0x10: ICALL native thunk (set during transform). Matches XeX.
     void** data_items;       // 0x14: Array of resolved tokens (classes, methods, fields) for MINT opcodes. Matches XeX.
     void* clauses;           // 0x18: MonoExceptionClause* array for try/catch/finally blocks. Matches XeX.
     uint32_t* arg_offsets;   // 0x1C: Per-argument stack offsets (uint32_t[], mempool-allocated). Matches XeX.
@@ -223,9 +241,9 @@ struct MonoMethodLayout {
     void* runtimeMethod;    // Offset 0x14 - RuntimeMethod* (compiled form)
     const char* name;       // Offset 0x18 - Method name
     uint32_t slotAndFlags;  // Offset 0x1C
-    void* nativeFunc;       // Offset 0x20 - ICALL function pointer (0xF2 handler reads *(method+0x20) -> thunk_00e52630 param_3)
+    void* nativeFunc;       // Offset 0x20 - UNION: ICALL fn ptr for icalls (0xF2 handler reads it) / cached MonoMethodHeader* for IL methods (mono_method_get_header caches here; the top gate keeps the two disjoint)
     uint32_t unknown2;      // Offset 0x24
-    // Total size: 0x28 bytes - NO header field!
+    // Total size: 0x28 bytes - NO dedicated header field (header rides the +0x20 union above)
 };
 
 static_assert(sizeof(MonoMethodLayout) == 0x28, "MonoMethodLayout size mismatch");
@@ -233,6 +251,19 @@ static_assert(offsetof(MonoMethodLayout, token) == 0x04, "token offset mismatch"
 static_assert(offsetof(MonoMethodLayout, klass) == 0x08, "klass offset mismatch");
 static_assert(offsetof(MonoMethodLayout, runtimeMethod) == 0x14, "runtimeMethod offset mismatch");
 static_assert(offsetof(MonoMethodLayout, name) == 0x18, "name offset mismatch");
+
+// INFLATED METHOD (0x30 bytes) - a method on a constructed generic type (or a constructed generic method)
+// Mirrors the runtime's inflation allocation (see Offsets::METHOD_INFLATED_CONTEXT notes)
+// Any copy of a method whose METHOD_IS_INFLATED_FLAG is set MUST be this full struct - a 0x28-byte copy loses context/declaring and aborts on the forced re-transform
+struct MonoMethodInflatedLayout {
+    MonoMethodLayout method; // 0x00..0x27
+    void* context;           // 0x28 - MonoGenericContext* (never null on a runtime-built inflated method)
+    void* declaring;         // 0x2C - the generic method definition
+};
+
+static_assert(sizeof(MonoMethodInflatedLayout) == 0x30, "MonoMethodInflatedLayout size mismatch");
+static_assert(offsetof(MonoMethodInflatedLayout, context) == Offsets::METHOD_INFLATED_CONTEXT, "context offset mismatch");
+static_assert(offsetof(MonoMethodInflatedLayout, declaring) == Offsets::METHOD_INFLATED_DECLARING, "declaring offset mismatch");
 
 // METHOD FLAGS - CLI method attribute bits
 namespace MethodFlags {

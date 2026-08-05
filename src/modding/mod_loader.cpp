@@ -7,6 +7,8 @@
 #include "../util/logger.h"
 #include "../core/exception_helper.h"
 #include <fstream>
+#include <cstring>
+#include <cstdlib>
 
 namespace S3MM {
 
@@ -591,25 +593,18 @@ int ModLoader::CheckApiVersion(void* image, const std::string& modName) {
         return -1;
     }
 
-    void* field = bridge.GetFieldFromName(metaClass, "ApiVersion");
-    if (!field) {
-        LOG_WARN("[ModLoader] S3MM_CompilerMeta found but ApiVersion field missing in '" + modName + "'");
-        return -1;
+    // Version is encoded in a method name "ApiVersion_<N>" (see ModCompiler) and read from metadata.
+    const char* kPrefix = "ApiVersion_";
+    const size_t kPrefixLen = 11; // strlen("ApiVersion_")
+    int iter = 0;
+    void* method = nullptr;
+    while ((method = bridge.GetNextMethod(metaClass, &iter)) != nullptr) {
+        const char* mName = *(const char**)((uintptr_t)method + Offsets::METHOD_NAME);
+        if (mName && strncmp(mName, kPrefix, kPrefixLen) == 0) { return atoi(mName + kPrefixLen); }
     }
 
-    // Get vtable (triggers .cctor which initializes the static field)
-    void* vtable = bridge.GetClassVTable(metaClass);
-    if (!vtable) {
-        LOG_WARN("[ModLoader] Failed to get vtable for S3MM_CompilerMeta in '" + modName + "'");
-        return -1;
-    }
-
-    // Read the static int value
-    uint64_t buf = 0; // 8-byte buffer per typed field overrun gotcha
-    bridge.GetStaticFieldValue(vtable, field, &buf);
-    int version = static_cast<int>(buf);
-
-    return version;
+    LOG_WARN("[ModLoader] S3MM_CompilerMeta found but no ApiVersion_<N> method in '" + modName + "'");
+    return -1;
 }
 
 // Check if method has Hook_/Watch_ naming convention and register with HookManager.
@@ -800,6 +795,7 @@ bool ModLoader::CheckAndRegisterHookFromAttribute(void* method, const std::strin
                     std::string sigDisplay = signature.empty() ? "" : signature;
                     LOG_INFO("[ModLoader] Found " + std::string(hookTypeName) + " (attr): " + targetClass + ":" + targetMethod + sigDisplay + " (priority=" + std::to_string(priority) + ")");
 
+                    // Baking is inferred from the handler IL at registration (HookUsesChain) - no Typed flag.
                     registered = HookManager::Get().RegisterHook(targetClass, targetMethod, method, hookType, modName, priority, signature);
                 }
             }

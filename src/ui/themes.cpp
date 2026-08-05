@@ -81,10 +81,13 @@ int ThemeLoader::ColorNameToIndex(const std::string& name) {
 ImVec4 ThemeLoader::ParseRgba(const std::string& str) {
     float r = 0, g = 0, b = 0, a = 1.0f;
     // Parse all components as floats: handles both 0-255 int and 0.0-1.0 float formats
-    if (sscanf(str.c_str(), "rgba(%f, %f, %f, %f)", &r, &g, &b, &a) >= 3 ||
-        sscanf(str.c_str(), "rgba(%f,%f,%f,%f)", &r, &g, &b, &a) >= 3) {
+    if (sscanf(str.c_str(), "rgba(%f, %f, %f, %f)", &r, &g, &b, &a) >= 3 || sscanf(str.c_str(), "rgba(%f,%f,%f,%f)", &r, &g, &b, &a) >= 3) {
         // If any RGB channel exceeds 1.0, treat as 0-255 range
-        if (r > 1.0f || g > 1.0f || b > 1.0f) { r /= 255.0f; g /= 255.0f; b /= 255.0f; }
+        if (r > 1.0f || g > 1.0f || b > 1.0f) {
+            r /= 255.0f;
+            g /= 255.0f;
+            b /= 255.0f;
+        }
         return ImVec4(r, g, b, a);
     }
     return ImVec4(1.0f, 1.0f, 1.0f, 1.0f); // Fallback white

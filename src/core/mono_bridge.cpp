@@ -566,15 +566,16 @@ static int InvokeWithSEH(void(__cdecl* invokeFunc)(void*), MonoInvokeState* stat
 // METHOD TRANSFORM - SEH-wrapped MINT preparation (no execution)
 // Returns: 1=already transformed, 2=transformed this call, 0=failure (caller logs).
 // Sets *outRtm to the RuntimeMethod* (nullable on failure) and *outRc to the transform return code.
-static int TransformWithSEH(void*(__cdecl* createRuntimeMethod)(void*), int(__cdecl* transformMethod)(void*), void* method, void* threadCtxSeed, void** outRtm, int* outRc) {
+static int TransformWithSEH(void*(__cdecl* createRuntimeMethod)(void*), int(__cdecl* transformMethod)(void*, void*), void* method, void* threadCtxSeed, void** outRtm, int* outRc) {
     ThreadCtxSnapshot snap = ThreadCtxSnapshot::Capture();
     *outRtm = nullptr;
     *outRc = 0;
 
-    // mono_interp_transform_method reads the thread context (ctx[3]=topFrame, ctx[4]=jmpBuf) from g_thread_context_tls_index.
-    // When we transform from the ProcessTasks drain outside any active interp call, that TLS is null, so transform faults at +0x55 dereferencing ctx[3].
-    // The engine's own out-of-interp transform path (00e52b90) handles this by installing a temporary zeroed thread context for the duration, then restoring.
-    // Mirror that: only override when the TLS is genuinely null
+    // mono_interp_transform_method takes the thread context as its explicit param_2, so the signature is (rtm, ctx)
+    // It writes the frame chain and setjmp buffer through ctx+0xc and ctx+0x10 and reads ctx+0x8, it does not pull the context from TLS
+    // We supply that context as tempCtx, passed to transformMethod below
+    // The engine's out-of-interp path (00e52b90) also installs the same context into g_thread_context_tls_index across create_runtime_method + transform, since create_runtime_method does consult TLS
+    // We mirror that, but only when the TLS is genuinely null - outside any active interp call, e.g. the ProcessTasks drain or hot-reload
     DWORD tlsIndex = *(DWORD*)Addresses::Profiler.g_thread_context_tls_index;
     void* savedCtx = TlsGetValue(tlsIndex);
 
@@ -598,7 +599,9 @@ static int TransformWithSEH(void*(__cdecl* createRuntimeMethod)(void*), int(__cd
             return 1;
         }
 
-        *outRc = transformMethod(rtm);
+        // Pass tempCtx as param_2, since transform writes its frame chain and setjmp buffer through ctx+0xc and ctx+0x10 (engine ref FUN_00e52b90 passes &local_28 here)
+        // Without it, transform stores through an uninitialized stack slot and smashes the guard bytes around tempCtx, an RTC #2
+        *outRc = transformMethod(rtm, tempCtx);
         if (installedTemp) TlsSetValue(tlsIndex, savedCtx);
         return (*outRc == 0) ? 2 : 0;
     } __except (TransformFaultFilter(GetExceptionInformation())) {
@@ -760,6 +763,38 @@ void* MonoBridge::BoxValue(void* klass, void* valuePtr) {
     return m_valueBox(domain, klass, valuePtr);
 }
 
+// BOX PAYLOAD SIZE - how many bytes mono_value_box will read from the source pointer
+// mono_value_box allocates via the klass vtable, then copies instance_size, 4 bytes out of valuePtr into boxed+4
+// The MonoObject header is 4 bytes not 8 hehe,haha, which is why the payload sits at +4, the same offset CacheAPI unboxes at
+// The copy length comes entirely from the class and is never bounded by the source, so boxing a klass larger than the source storage silently reads past it
+// Returns 0 when the size cannot be established, either a bad pointer or a class whose instance_size is not filled in yet
+// The real mono_class_instance_size force-inits the class first, we deliberately do not
+// Callers must also treat 0 as unknown, not as zero-sized
+uint32_t MonoBridge::GetBoxPayloadSize(void* klass) {
+    if (!klass || !IsValidPointer(klass)) return 0;
+
+    uint32_t instanceSize = *(uint32_t*)((uintptr_t)klass + Offsets::CLASS_INSTANCE_SIZE);
+    if (instanceSize <= BOXED_PAYLOAD_OFFSET) return 0; // uninitialised or implausible
+    return instanceSize - BOXED_PAYLOAD_OFFSET;
+}
+
+// GUARDED VALUE BOXING - box a value whose payload lives in availableBytes of readable storage
+// Refuses rather than over-reading when the class is provably larger than the source
+// An unknown payload size (0) falls through to the unguarded box, so only the provably-unsafe case is rejected
+void* MonoBridge::BoxValueChecked(void* klass, void* valuePtr, uint32_t availableBytes, const char* site) {
+    uint32_t payload = GetBoxPayloadSize(klass);
+
+    if (payload > availableBytes) {
+        const char* klassName = GetClassName(klass);
+        LOG_ERROR("[MonoBridge] BoxValueChecked: refusing to box " + std::string(klassName ? klassName : "<unknown>") + " at " + std::string(site ? site : "?") + " - payload is " + std::to_string(payload) +
+                  " bytes but only " + std::to_string(availableBytes) + " are readable. Value types larger than " + std::to_string(availableBytes) +
+                  " bytes are not supported on this return path (the interpreter keeps the payload on the vt side-stack, which is not mapped); returning null instead of corrupt data.");
+        return nullptr;
+    }
+
+    return BoxValue(klass, valuePtr);
+}
+
 int MonoBridge::GetTypeDefCount(void* image) {
     if (!image || !IsValidPointer(image)) return 0;
     uint32_t value = *(uint32_t*)((uintptr_t)image + 0x80);
@@ -898,6 +933,33 @@ static std::string ProbeStringSafe(void* base, int offset, int maxLen = 20) {
     if (maxLen > 255) maxLen = 255;
     if (ProbeStringSafe_Impl(base, offset, buf, maxLen)) { return std::string(buf); }
     return "null";
+}
+
+// FRESH ENUMERATION - re-walk loaded_assemblies on demand, no cache and no logging
+// Callers see assemblies that loaded after the one-time InitializeAllImages snapshot, e.g. on world-load script mods
+std::vector<void*> MonoBridge::EnumerateLoadedImagesFresh() const {
+    std::vector<void*> images;
+    constexpr uintptr_t LOADED_ASSEMBLIES_ADDR = 0x011f422c; // GList* (same global InitializeAllImages walks)
+    constexpr int ASSEMBLY_IMAGE_OFFSET = 0x44;              // MonoAssembly+0x44 = MonoImage*
+
+    void* listHead = *(void**)LOADED_ASSEMBLIES_ADDR;
+    if (!listHead || !IsValidPointer(listHead)) return images;
+
+    std::set<void*> seen;
+    void* node = listHead;
+    int count = 0;
+    while (node && IsValidPointer(node) && count < 500) {
+        void* assembly = *(void**)((uintptr_t)node + 0x00); // GList->data = MonoAssembly*
+        if (assembly && IsValidPointer(assembly)) {
+            void* image = *(void**)((uintptr_t)assembly + ASSEMBLY_IMAGE_OFFSET);
+            if (image && IsValidPointer(image) && seen.insert(image).second) images.push_back(image);
+        }
+        void* next = *(void**)((uintptr_t)node + 0x04); // GList->next
+        if (next == node) break;                        // circular guard
+        node = next;
+        ++count;
+    }
+    return images;
 }
 
 // INITIALIZE ALL IMAGES - Walk loaded_assemblies GList (includes .package mods)

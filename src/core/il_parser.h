@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,9 @@ ILOperandType GetOpcodeOperandType(uint8_t opcode);
 // Get operand type for a 0xFE-prefixed opcode
 ILOperandType GetOpcodeOperandTypeFE(uint8_t opcode2);
 
+// Invoke fn(token, ilOffset) for every `call` (0x28) site in an IL body; returning false from fn stops the walk
+void ForEachCallSite(const uint8_t* il, uint32_t ilSize, const std::function<bool(uint32_t token, uint32_t ilOffset)>& fn);
+
 // BLOB SIGNATURE DECODING - Parse ECMA-335 compressed signatures
 // Decode compressed unsigned int from blob data. Advances *pp past the decoded value. Returns 0 on error.
 uint32_t DecodeCompressedUInt(const uint8_t** pp, const uint8_t* end);
@@ -90,7 +94,26 @@ uint32_t DecodeCompressedUInt(const uint8_t** pp, const uint8_t* end);
 // Decode a type signature from blob data into a deterministic string.
 std::string DecodeTypeSig(void* image, const uint8_t** pp, const uint8_t* end, int depth = 0);
 
+// Decoded generic args of a MethodSpec (table 0x2B) call site
+struct MethodSpecGenericArgs {
+    bool valid = false; // false if the token isn't a MethodSpec, or the blob couldn't be read
+    uint32_t count = 0; // GenArgCount from the blob - the authoritative generic arity
+
+    // Per-arg leading ECMA element type (matching MonoTypeCode, BYREF = 0x10); may be shorter than count if the walk bailed mid-list
+    std::vector<uint8_t> leadingElementTypes;
+};
+
+// Decode a MethodSpec token's instantiation blob into generic-arg arity and per-arg element type; valid=false on non-MethodSpec or decode failure
+MethodSpecGenericArgs DecodeMethodSpecGenericArgs(void* image, uint32_t token);
+
 // Resolve a TypeDefOrRef coded index to a name string.
 std::string ResolveTypeDefOrRef(void* image, uint32_t codedIndex);
+
+// Resolve a MemberRef (table 0x0A) row to "Namespace.Type::Member"; memberRefRow is 0-based, "" if out of range
+std::string ResolveMemberRefFull(void* image, uint32_t memberRefRow);
+
+// Resolve a call/callvirt target token to its declaring "Namespace.Type::Member", following a MethodSpec (0x2B) through to its MemberRef
+// Returns "" for tokens with no MemberRef owner (a MethodDef callee lives in the mod's own assembly)
+std::string ResolveCallTargetFull(void* image, uint32_t token);
 
 } // namespace S3MM

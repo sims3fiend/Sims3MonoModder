@@ -492,7 +492,8 @@ void __cdecl MonoProfiler::HookedInvokeWithState(void* state) {
 
 // HOOKED ALLOCATION CALLBACK - Called by Mono's allocation profiler infrastructure
 void __cdecl MonoProfiler::HookedAllocationCallback(void* profilerPtr, void* object, void* klass) {
-    (void)profilerPtr; (void)object;
+    (void)profilerPtr;
+    (void)object;
     auto& profiler = Get();
 
     if (!profiler.m_running.load(std::memory_order_relaxed)) { return; }

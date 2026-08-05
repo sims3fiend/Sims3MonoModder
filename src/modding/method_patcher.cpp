@@ -11,6 +11,29 @@ MethodPatcher& MethodPatcher::Get() {
     return instance;
 }
 
+// COMPILE PROXY ALLOCATION - always the full 0x30-byte MonoMethodInflatedLayout, extension zeroed
+// A proxy borrowing an INFLATED original's signature trips transform_method's sig-inflated-bit gate (sig+0x08 & 0x40000000)
+// The gate unconditionally reads context at proxy+0x28, four bytes past a plain 0x28-byte MonoMethodLayout allocation
+// Mirroring the original's context/declaring makes that read in-bounds and correct
+// (context is only consulted for VAR/MVAR positions, absent from hook IL, but a MethodSpec forward like Chain.CallNext<R,..> routes through the same context-taking resolver)
+// The proxy's own is_inflated bit stays CLEAR (copied from the hook) so signature/header lazy resolution keeps using the hook's token/klass
+// Returns the full allocation; callers use &proxy->method as the MonoMethod* and delete the returned pointer (not the inner method) on failure
+static MonoMethodInflatedLayout* MakeCompileProxy(const MonoMethodLayout* replacement, const MonoMethodLayout* original, bool borrowOriginalConvention) {
+    auto* p = new MonoMethodInflatedLayout{};
+    p->method = *replacement;
+    p->method.runtimeMethod = nullptr;
+    if (borrowOriginalConvention) {
+        p->method.signature = original->signature;
+        p->method.flagsPacked = original->flagsPacked;
+        if (original->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG) {
+            auto* inf = reinterpret_cast<const MonoMethodInflatedLayout*>(original);
+            p->context = inf->context;
+            p->declaring = inf->declaring;
+        }
+    }
+    return p;
+}
+
 bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMethod, bool* deferredRestore, void** ioInstalledRTM) {
     if (!originalMethod || !replacementMethod) {
         LOG_ERROR("[MethodPatcher] ForcePatchMethod: null method pointer");
@@ -30,19 +53,31 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
 
     LOG_DEBUG("[MethodPatcher] ForcePatch: " + origName + " -> " + replName);
 
-    // DOMAIN HASH CACHE BYPASS - two install strategies depending on prior compilation.
-    // If original has a compiled RTM, a stale MonoDomain->jit_code_hash entry would reinstate the old RTM.
-    // So pre-compile a fresh RTM via a heap-allocated proxy (never entered into the hash) and transplant it onto original.
-    // If original was never compiled (runtimeMethod == nullptr), no hash entry exists.
-    // Then clobber token/klass directly so lazy first-call compilation reads the hook's IL.
+    // FRESH-RTM TRANSPLANT - two install strategies depending on prior compilation
+    // Stock mono caches RTMs in MonoDomain->jit_code_hash; the EA build removed that, create_runtime_method (0xe51f20) uses MonoMethod+0x14
+    // An already-transformed method can't be re-transformed (transform early-outs on RTM flags & 0x100), so the hook RTM is built off-heap
+    // Pre-patch callers interned the old RTM pointer in their MINT data_items, so the old RTM must stay valid (hot-reload edits it in place)
+    // Already-compiled original: transform a heap proxy, transplant the fresh RTM onto original->runtimeMethod
+    // Never-compiled original: clobber token/klass so lazy first-call compilation reads the hook's IL
     // Caller is told which path ran via deferredRestore.
 
     // Detect instance->static (static hook replacing an instance method)
     bool instanceToStatic = ((original->flagsPacked & MethodFlags::STATIC) == 0) && ((replacement->flagsPacked & MethodFlags::STATIC) != 0);
 
-    // Proxy-compile only when original was already compiled (non-null runtimeMethod => stale hash entry; see top block).
-    // Never-compiled methods have no hash entry, so the clobber path suffices and avoids VEH crashes from an unresolvable proxy.
+    // Proxy-compile only when original was already compiled (non-null runtimeMethod => transformed RTM we can't re-transform + cached callers; see top block).
+    // Never-compiled methods have no RTM at all, so the clobber path suffices and avoids VEH crashes from an unresolvable proxy.
     bool needsProxyCompile = (original->runtimeMethod != nullptr);
+
+    // INFLATED never-compiled target (the common case for a generic interaction method hooked at mod load, before gameplay ever ran it)
+    // The clobber fallback is unsound for this shape, lazy header fetch on an inflated method ignores the swapped token/klass and re-derives IL from declaring (+0x2C), so the "hook" would recompile the ORIGINAL body
+    // Pre-transform the REAL original instead (exactly what the game's own first call would do so it's safe for inflated methods)
+    // so the install proceeds through the RTM-transplant proxy path
+    if (!needsProxyCompile && (original->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG)) {
+        LOG_DEBUG("[MethodPatcher] Inflated never-compiled target - pre-transforming original to enable the proxy path");
+        MonoBridge::Get().TransformMethod(originalMethod);
+        needsProxyCompile = (original->runtimeMethod != nullptr);
+        if (!needsProxyCompile) { LOG_WARN("[MethodPatcher] Pre-transform of inflated target " + origName + " did not produce an RTM - install will likely fail cleanly below"); }
+    }
 
     DWORD oldProtect;
 
@@ -51,17 +86,14 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
     // We overwrite the installed RTM's contents rather than swapping original->runtimeMethod to a new RTM the callers would never see.
     // Source the new bytecode by transforming the REAL replacement method.
     // Transforming a detached proxy SEH-crashes against freshly-loaded hot-reload images, whereas the real hook method is exactly what the game compiles lazily.
-    // Never touch original->runtimeMethod or the domain hash here, so the proxy's hash-bypass rationale doesn't apply.
+    // Never touch original->runtimeMethod here, so the proxy's fresh-RTM rationale doesn't apply.
     if (ioInstalledRTM && *ioInstalledRTM && original->runtimeMethod == *ioInstalledRTM) {
         void* srcRtm = nullptr;
         if (instanceToStatic) {
-            // instance->static needs the original's instance calling convention baked into the MINT.
-            // So a signature-borrowing proxy is unavoidable here.
-            auto* p = new MonoMethodLayout(*replacement);
-            p->runtimeMethod = nullptr;
-            p->signature = original->signature;
-            p->flagsPacked = original->flagsPacked;
-            if (MonoBridge::Get().TransformMethod(p)) { srcRtm = p->runtimeMethod; } // p leaked (mempool-backed)
+            // instance->static needs the original's instance calling convention baked into the MINT,
+            // so a signature-borrowing proxy is unavoidable here (inflated-aware: see MakeCompileProxy)
+            auto* p = MakeCompileProxy(replacement, original, true);
+            if (MonoBridge::Get().TransformMethod(&p->method)) { srcRtm = p->method.runtimeMethod; } // p leaked (mempool-backed)
         } else {
             // Transform the real hook method directly (idempotent if the game already compiled it).
             if (MonoBridge::Get().TransformMethod(replacementMethod)) { srcRtm = replacement->runtimeMethod; }
@@ -86,19 +118,16 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
     }
 
     if (needsProxyCompile) {
-        // PROXY PATH - Bypass stale domain hash entry
-        auto* compileProxy = new MonoMethodLayout(*replacement);
-        compileProxy->runtimeMethod = nullptr;
+        // PROXY PATH - build the hook RTM off-heap (an already-transformed original can't be re-transformed)
+        // Proxy for instance->static must use original's instance calling convention so MINT maps ldarg.0 -> this (hasthis=1)
+        // a static convention here would compile an RTM that mismatches call sites
+        // MakeCompileProxy is inflated-aware: borrowing an inflated original's signature requires the 0x30-byte
+        // allocation w/ mirrored context/declaring, or transform's sig-gated context read runs off the end
+        auto* proxyAlloc = MakeCompileProxy(replacement, original, instanceToStatic);
+        MonoMethodLayout* compileProxy = &proxyAlloc->method;
+        if (instanceToStatic) { LOG_DEBUG("[MethodPatcher] ForcePatch instance->static: proxy uses original's calling convention"); }
 
-        if (instanceToStatic) {
-            // Proxy must use original's instance calling convention so MINT maps ldarg.0 -> this (hasthis=1).
-            // A static convention here would compile an RTM that mismatches call sites.
-            compileProxy->signature = original->signature;
-            compileProxy->flagsPacked = original->flagsPacked;
-            LOG_DEBUG("[MethodPatcher] ForcePatch instance->static: proxy uses original's calling convention");
-        }
-
-        LOG_DEBUG("[MethodPatcher] Pre-compiling via proxy to bypass domain hash cache");
+        LOG_DEBUG("[MethodPatcher] Pre-compiling via proxy (original already transformed)");
 
         // Use the MINT transform path (interp_get_imethod + interp_transform_method) instead of InvokeMethod.
         // InvokeMethod actually *executes* the proxy body. For hooks with parameters (e.g. float(float,float)) the interpreter dereferences NULL when copying args from `params == nullptr`.
@@ -116,7 +145,7 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
             // Remember it so future reloads overwrite its contents in place (handled by the in-place branch above).
             if (!VirtualProtect(originalMethod, sizeof(MonoMethodLayout), PAGE_EXECUTE_READWRITE, &oldProtect)) {
                 LOG_ERROR("[MethodPatcher] ForcePatchMethod: VirtualProtect failed");
-                delete compileProxy;
+                delete proxyAlloc;
                 return false;
             }
             original->runtimeMethod = compileProxy->runtimeMethod;
@@ -133,10 +162,18 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
 
         // Proxy compilation failed, fall through to clobber path
         LOG_WARN("[MethodPatcher] Proxy compilation failed for: " + origName + " - falling back to clobber");
-        delete compileProxy;
+        delete proxyAlloc;
     }
 
     // CLOBBER PATH - No stale hash entry (or proxy failed), overwrite token/klass so lazy compilation reads hook IL
+    // INFLATED original + instanceToStatic clobber is unsound: the token/klass swap assumes lazy header fetch reads them, but mono_method_get_header's
+    // inflated branch ignores both and re-derives the header from declaring (+0x2C), the "hook" would silently recompile the ORIGINAL body, so refuse instead
+    // The full-copy branch \/ is fine since it clears is_inflated along with the rest of slotAndFlags
+    if (instanceToStatic && (original->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG)) {
+        LOG_ERROR("[MethodPatcher] ForcePatchMethod: clobber fallback cannot patch an inflated (generic) instance target with a static hook - " + origName + " left unpatched");
+        return false;
+    }
+
     if (!VirtualProtect(originalMethod, sizeof(MonoMethodLayout), PAGE_EXECUTE_READWRITE, &oldProtect)) {
         LOG_ERROR("[MethodPatcher] ForcePatchMethod: VirtualProtect failed");
         return false;

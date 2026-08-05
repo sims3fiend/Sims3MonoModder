@@ -399,6 +399,38 @@ ILOperandType GetOpcodeOperandTypeFE(uint8_t opcode2) {
     return (opcode2 < 32) ? (ILOperandType)s_opcodeOperandFE[opcode2] : OP_NONE;
 }
 
+// TYPE-CORRECT CALL-SITE WALK - one skeleton for every `call`-site scan, see il_parser.h
+void ForEachCallSite(const uint8_t* il, uint32_t ilSize, const std::function<bool(uint32_t token, uint32_t ilOffset)>& fn) {
+    if (!il || ilSize == 0) return;
+
+    uint32_t pos = 0;
+    while (pos < ilSize) {
+        uint32_t insnOff = pos;
+        uint8_t op = il[pos++];
+
+        if (op == 0xFE) { // two-byte prefix
+            if (pos >= ilSize) break;
+            uint8_t op2 = il[pos++];
+            pos += GetOperandSize(GetOpcodeOperandTypeFE(op2));
+            continue;
+        }
+
+        ILOperandType t = GetOpcodeOperandType(op);
+        if (t == OP_TOKEN && pos + 4 <= ilSize) {
+            if (op == 0x28) { // call
+                uint32_t token = *(const uint32_t*)(il + pos);
+                if (!fn(token, insnOff)) return;
+            }
+            pos += 4;
+        } else if (t == OP_SWITCH && pos + 4 <= ilSize) {
+            uint32_t count = *(const uint32_t*)(il + pos);
+            pos += 4 + count * 4;
+        } else {
+            pos += GetOperandSize(t);
+        }
+    }
+}
+
 // BLOB SIGNATURE DECODING - Compressed uint and type signature parsing
 
 uint32_t DecodeCompressedUInt(const uint8_t** pp, const uint8_t* end) {
@@ -451,6 +483,82 @@ std::string ResolveTypeDefOrRef(void* image, uint32_t codedIndex) {
 
     // TypeSpec referencing another TypeSpec - avoid infinite recursion, use generic fallback
     return "TypeSpec";
+}
+
+std::string ResolveMemberRefFull(void* image, uint32_t memberRefRow) {
+    EnsureMetadataFunctions();
+    void* mrTable = GetTableInfo(image, MONO_TABLE_MEMBERREF);
+    if ((int)memberRefRow >= GetTableRowCount(mrTable)) return "";
+
+    uint32_t classCoded = s_metadataDecodeRowCol(mrTable, memberRefRow, 0); // Class = MemberRefParent coded index
+    uint32_t nameIdx = s_metadataDecodeRowCol(mrTable, memberRefRow, 1);    // Name
+    const char* member = s_metadataStringHeap(image, nameIdx);
+
+    // MemberRefParent - 3-bit tag {0 TypeDef, 1 TypeRef, 2 ModuleRef, 3 MethodDef, 4 TypeSpec}, row is 1-based
+    uint32_t tag = classCoded & 0x07;
+    uint32_t row = (classCoded >> 3);
+    std::string typeName;
+    if ((tag == 0 || tag == 1) && row >= 1) { // TypeDef / TypeRef both: TypeName(1), TypeNamespace(2)
+        int tableId = (tag == 0) ? MONO_TABLE_TYPEDEF : MONO_TABLE_TYPEREF;
+        void* tt = GetTableInfo(image, tableId);
+        if ((int)(row - 1) < GetTableRowCount(tt)) {
+            const char* tn = s_metadataStringHeap(image, s_metadataDecodeRowCol(tt, row - 1, 1));
+            const char* tns = s_metadataStringHeap(image, s_metadataDecodeRowCol(tt, row - 1, 2));
+            if (tns && tns[0]) {
+                typeName = tns;
+                typeName += '.';
+            }
+            if (tn) typeName += tn;
+        }
+    } else if (tag == 4 && row >= 1) { // TypeSpec - decode the type signature blob
+        void* tst = GetTableInfo(image, MONO_TABLE_TYPESPEC);
+        if ((int)(row - 1) < GetTableRowCount(tst)) {
+            uint32_t blobIdx = s_metadataDecodeRowCol(tst, row - 1, 0);
+            const uint8_t* blob = s_metadataBlobHeap ? s_metadataBlobHeap(image, blobIdx) : nullptr;
+            if (blob && IsReadablePointer((void*)blob, 4)) { // 4 = max length-prefix bytes (no 'end' yet)
+                const uint8_t* p = blob;
+                uint32_t len = 0;
+                if ((*p & 0x80) == 0) {
+                    len = *p++;
+                } else if ((*p & 0xC0) == 0x80) {
+                    len = ((*p & 0x3F) << 8) | p[1];
+                    p += 2;
+                } else {
+                    len = ((*p & 0x1F) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+                    p += 4;
+                }
+                const uint8_t* end = p + len;
+                typeName = DecodeTypeSig(image, &p, end, 0);
+            }
+        }
+    }
+
+    std::string result = typeName.empty() ? "?" : typeName;
+    result += "::";
+    result += (member && member[0]) ? member : "?";
+    return result;
+}
+
+std::string ResolveCallTargetFull(void* image, uint32_t token) {
+    EnsureMetadataFunctions();
+    uint32_t tableId = (token >> 24) & 0xFF;
+    uint32_t row = (token & 0xFFFFFF);
+    if (row == 0) return "";
+    row -= 1; // metadata rows are 1-based in the token
+
+    if (tableId == 0x0A) { // MemberRef directly (e.g. the bare CallNextVoid() / a non-generic helper)
+        return ResolveMemberRefFull(image, row);
+    }
+    if (tableId == 0x2B) { // MethodSpec - follow col 0 (MethodDefOrRef) to its MemberRef
+        void* tableInfo = GetTableInfo(image, MONO_TABLE_METHODSPEC);
+        if ((int)row >= GetTableRowCount(tableInfo)) return "";
+        uint32_t methodCoded = s_metadataDecodeRowCol(tableInfo, row, 0);
+        uint32_t tag = methodCoded & 1;          // 0 = MethodDef, 1 = MemberRef
+        uint32_t methodRow = (methodCoded >> 1); // 1-based
+        if (tag == 1 && methodRow >= 1) { return ResolveMemberRefFull(image, methodRow - 1); }
+        return ""; // MethodDef-defined generic: in the mod's own assembly, never the referenced S3MM.Chain helper
+    }
+    return "";
 }
 
 std::string DecodeTypeSig(void* image, const uint8_t** pp, const uint8_t* end, int depth) {
@@ -527,7 +635,17 @@ std::string DecodeTypeSig(void* image, const uint8_t** pp, const uint8_t* end, i
         return elemType + "[" + std::to_string(rank) + "]";
     }
 
-    case 0x15: { // GENERICINST <class|valuetype> <TypeDefOrRef> <argCount> <args...>
+    case 0x1F:   // CMOD_REQD <TypeDefOrRefOrSpecEncoded> <modified-type>
+    case 0x20: { // CMOD_OPT  <TypeDefOrRefOrSpecEncoded> <modified-type>
+        // A custom modifier prefixes the real type, so consume its coded index then decode the type it modifies
+        // Without this the byte walk desyncs and mis-tags every later generic arg in a MethodSpec instantiation walk
+        uint32_t modIdx = DecodeCompressedUInt(pp, end);
+        (void)modIdx;
+        return DecodeTypeSig(image, pp, end, depth + 1);
+    }
+
+    case 0x15: {                               // GENERICINST <class|valuetype> <TypeDefOrRef> <argCount> <args...>
+        if (*pp >= end) return "GenericInst?"; // the function-top guard only covered the FIRST byte, not this one
         uint8_t classOrValue = **pp;
         (*pp)++; // 0x11 or 0x12
         (void)classOrValue;
@@ -535,7 +653,9 @@ std::string DecodeTypeSig(void* image, const uint8_t** pp, const uint8_t* end, i
         std::string baseName = ResolveTypeDefOrRef(image, codedIdx);
         uint32_t argCount = DecodeCompressedUInt(pp, end);
         baseName += "<";
-        for (uint32_t i = 0; i < argCount && i < 16; i++) {
+        // Consume EVERY arg - a cap desyncs the byte walk and mis-tags every later entry in a MethodSpec instantiation walk
+        // The `end` bound keeps a corrupt argCount from spinning
+        for (uint32_t i = 0; i < argCount && *pp < end; i++) {
             if (i > 0) baseName += ",";
             baseName += DecodeTypeSig(image, pp, end, depth + 1);
         }
@@ -708,7 +828,7 @@ std::string ResolveMetadataToken(void* image, uint32_t token) {
         void* tsTableInfo = GetTableInfo(image, MONO_TABLE_TYPESPEC);
         uint32_t blobIdx = s_metadataDecodeRowCol(tsTableInfo, row, 0);
         const uint8_t* blob = s_metadataBlobHeap(image, blobIdx);
-        if (!blob) return "TypeSpec?";
+        if (!blob || !IsReadablePointer((void*)blob, 4)) return "TypeSpec?"; // 4 = max length-prefix bytes (no 'end' yet)
 
         // Decode length prefix
         const uint8_t* p = blob;
@@ -798,6 +918,66 @@ std::string ResolveMetadataToken(void* image, uint32_t token) {
     default:
         return "tok_" + std::to_string(token);
     }
+}
+
+// METHODSPEC INSTANTIATION - decode the blob into its generic-arg arity and per-arg leading element type
+// METHODSPEC column 1 is the Instantiation blob index
+// The blob is a compressed length, then a one-byte kind (0x0A), then a compressed GenArgCount, then that many type signatures
+// momo's reader never reads that kind byte, it just steps the pointer past it so checking it here is deliberately stricter than the runtime
+// Each arg advances through DecodeTypeSig so nested, array and generic args don't desync the walk, the per-arg leading byte is captured first, since it is the arg's coarse stack type
+MethodSpecGenericArgs DecodeMethodSpecGenericArgs(void* image, uint32_t token) {
+    MethodSpecGenericArgs out;
+    EnsureMetadataFunctions();
+    if (!image || !s_metadataBlobHeap || !s_metadataDecodeRowCol) return out;
+
+    uint8_t tableId = (token >> 24) & 0xFF;
+    if (tableId != 0x2B) return out; // only a MethodSpec carries a generic instantiation
+    int row = (int)(token & 0x00FFFFFF) - 1;
+    if (row < 0) return out;
+
+    void* tableInfo = GetTableInfo(image, MONO_TABLE_METHODSPEC);
+    if (row >= GetTableRowCount(tableInfo)) return out;
+
+    uint32_t blobIdx = s_metadataDecodeRowCol(tableInfo, row, 1); // col 1 = Instantiation
+    const uint8_t* blob = s_metadataBlobHeap(image, blobIdx);
+    // The length prefix is 1, 2 or 4 bytes and 'end' derives from it, so there is no bound yet
+    // Probe 4 readable bytes before decoding the multi-byte forms, since a truncated heap entry would otherwise read up to 3 bytes past it
+    if (!IsReadablePointer((void*)blob, 4)) return out;
+
+    // Compressed length prefix (ECMA II.24.2.4)
+    const uint8_t* p = blob;
+    uint32_t len = 0;
+    if ((*p & 0x80) == 0) {
+        len = *p++;
+    } else if ((*p & 0xC0) == 0x80) {
+        len = ((*p & 0x3F) << 8) | p[1];
+        p += 2;
+    } else {
+        len = ((*p & 0x1F) << 24) | (p[1] << 16) | (p[2] << 8) | p[3];
+        p += 4;
+    }
+    if (len == 0) return out;
+    const uint8_t* end = p + len;
+
+    // Kind byte, then the authoritative generic-arg count
+    if (p >= end || *p++ != 0x0A) return out;
+    uint32_t count = DecodeCompressedUInt(&p, end);
+    // mono g_asserts on a zero count, we bail instead so a malformed mod assembly can't abort the game
+    if (count == 0 || count > 64) return out; // the upper bound is slack, a real CallNext<...> is far under 64
+
+    out.count = count;
+    out.leadingElementTypes.reserve(count);
+    for (uint32_t i = 0; i < count; ++i) {
+        if (p >= end) break; // ran out of blob ;( - leave fewer tags but keep the authoritative count
+        uint8_t lead = *p;   // leading element byte, read before the type sig is consumed (BYREF reports 0x10)
+        const uint8_t* before = p;
+        DecodeTypeSig(image, &p, end, 0);  // advance past this arg's full type signature
+        if (p <= before || p > end) break; // no progress or overran, so stop collecting - count stays valid
+        out.leadingElementTypes.push_back(lead);
+    }
+
+    out.valid = true;
+    return out;
 }
 
 // NORMALIZED IL HASH - FNV-1a hash with token resolution for semantic comparison

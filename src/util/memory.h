@@ -2,6 +2,7 @@
 #include <Windows.h>
 #include <Psapi.h>
 #include <cstdint>
+#include <string>
 
 namespace S3MM {
 
@@ -41,6 +42,17 @@ inline bool IsGameProcess() {
     }
     return (_stricmp(fname, "TS3.exe") == 0 || _stricmp(fname, "TS3W.exe") == 0);
 }
+
+// CO-RESIDENT MODULE SNAPSHOT - read-only [base,end) list of loaded modules, taken once at mono-ready
+// Attribution only: feeds the VEH crash log's "fault address in <OtherMod.dll>" line and the startup listing of other native mods sharing the process
+void SnapshotModules();
+
+// Resolve a code address to the owning module's base name (e.g. "SomeMod.dll"), or "" if it is the main image, MM itself, or not in any snapshotted module
+// Reads the snapshot only, so it is safe to call from a post-crash context
+std::string ResolveModuleForAddress(uintptr_t addr);
+
+// Log modules loaded from the game directory (ASIs, proxy DLLs, other native patchers) - the "these are also running" record for conflict triage
+void LogCoResidentModules();
 
 } // namespace Memory
 

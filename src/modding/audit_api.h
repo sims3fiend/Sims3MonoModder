@@ -17,6 +17,13 @@ class AuditAPI {
     // Returns 1 if a core assembly was loaded from .package, else 0
     static int32_t __cdecl NativeIsAssemblyReplaced(void* assemblyNameStr);
 
+    // Returns 1 if "Class:Method" dispatches via the zero-overhead BAKED chain (vs the boxing path), else 0
+    // Distinct from IsMethodHooked: a hooked method can still be on the boxing path (hooked=1, baked=0)
+    static int32_t __cdecl NativeIsMethodBaked(void* classMethodStr);
+
+    // Returns the reason a typed hook on "Class:Method" failed to bake (managed string), or null if it baked cleanly / has no typed hooks / isn't hooked, let's a mod specify why
+    static void* __cdecl NativeGetBakeRejectReason(void* classMethodStr);
+
     // TIER 2 - Bulk queries returning typed managed arrays
 
     // Total number of hook chains (not individual hooks)
@@ -47,13 +54,14 @@ class AuditAPI {
     static bool s_typesInitialized;
     static bool InitManagedTypes(); // Returns false on failure
 
-    // HookInfo struct: { string Target, string ModName, int Priority, bool IsWatcher }
+    // HookInfo struct: { string Target, string ModName, int Priority, bool IsWatcher, bool IsEntry }
     static void* s_hookInfoKlass;      // MonoClass* for S3MM.HookInfo
     static int32_t s_hookInfoElemSize; // Unboxed size (instance_size - 8)
     static int32_t s_hiTargetOff;      // field->offset - 8 (adjusted for inline value type)
     static int32_t s_hiModNameOff;
     static int32_t s_hiPriorityOff;
     static int32_t s_hiIsWatcherOff;
+    static int32_t s_hiIsEntryOff;
 
     // ReplacedAssembly struct: { string AssemblyName, string SourcePackage }
     static void* s_replacedAsmKlass;
@@ -62,7 +70,7 @@ class AuditAPI {
     static int32_t s_raSourcePackageOff;
 
     // Helper: write a HookInfo element into array at index
-    static void WriteHookInfo(void* array, int32_t index, void* targetStr, const char* modName, int32_t priority, bool isWatcher);
+    static void WriteHookInfo(void* array, int32_t index, void* targetStr, const char* modName, int32_t priority, bool isWatcher, bool isEntry);
 };
 
 } // namespace S3MM

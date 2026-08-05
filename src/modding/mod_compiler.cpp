@@ -130,6 +130,17 @@ std::vector<ModInfo> ModCompiler::DiscoverMods() {
                     }
                 }
 
+                // S3MM.Helper.dll is a /reference for every mod, so a newer helper (e.g. after an API bump) makes a cached DLL stale
+                // Recompile it, or it keeps the old API stamp and surface
+                if (!sourceNewer) {
+                    std::filesystem::path helperRef = m_libsPath / "S3MM.Helper.dll";
+                    std::error_code ec;
+                    if (std::filesystem::exists(helperRef, ec)) {
+                        auto helperTime = std::filesystem::last_write_time(helperRef, ec);
+                        if (!ec && helperTime > dllTime) { sourceNewer = true; }
+                    }
+                }
+
                 if (!sourceNewer) {
                     mod.compiledSuccessfully = true;
                     mod.needsRecompile = false;
@@ -250,11 +261,12 @@ bool ModCompiler::RunCompiler(const ModInfo& mod, const std::filesystem::path& o
     // Add source files
     for (const auto& src : mod.sourceFiles) { cmd << " \"" << src.string() << "\""; }
 
-    // Generate API version metadata file, injected into every mod compilation. This embeds the API version the mod was compiled against, readable by the native loader.
+    // Generate API version metadata, injected into every mod compilation.
+    // Encoded in a METHOD NAME ("ApiVersion_<N>"), not a static field, the loader never runs the .cctor that would init a field (it reads back 0), but a method name is pure metadata ;) See ModLoader::CheckApiVersion.
     std::filesystem::path versionFile = m_basePath / "_s3mm_version.cs";
     {
         std::ofstream vf(versionFile);
-        vf << "internal static class S3MM_CompilerMeta { internal static int ApiVersion = " << API_VERSION << "; }" << std::endl;
+        vf << "internal static class S3MM_CompilerMeta { internal static void ApiVersion_" << API_VERSION << "() {} }" << std::endl;
     }
     cmd << " \"" << versionFile.string() << "\"";
 

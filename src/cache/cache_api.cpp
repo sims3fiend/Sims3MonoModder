@@ -374,11 +374,18 @@ void* __cdecl CacheAPI::NativeInvoke(void* method, void* instance, void* argsArr
         return nullptr;
     }
 
-    // Value type: box and return
+    // Value type: the invoke path has ALREADY boxed the return - interp_mono_invoke_with_state's setup helper (0xe52c70) 
+    // pre-allocates pRetVal = mono_object_new(domain, retClass) with pRet = box+0x4, and RET_VT / the invoke tail's stackval_to_data fill the box payload (any width, wide structs included).
+    // See HookManager::BoxInvokeResult
+    if (state.pRetVal) return state.pRetVal;
+
+    // Fallback: pre-box missing (setup helper never ran / unresolvable return class) - manual box
     void* valueKlass = GetValueTypeKlass(retTypeCode, retType);
     if (!valueKlass) {
-        LOG_WARN("[CacheAPI] Invoke: unknown return type code " + std::to_string((int)retTypeCode));
-        return state.pRet;
+        // Never hand back the raw pRet payload pointer as if it were an object - that is exactly the
+        // pointer-shaped-garbage failure mode the terminals exist to prevent
+        LOG_WARN("[CacheAPI] Invoke: unknown return type code " + std::to_string((int)retTypeCode) + " and no pre-boxed pRetVal - returning null");
+        return nullptr;
     }
 
     if (!state.pRet) return nullptr;

@@ -109,7 +109,26 @@ class MonoBridge {
     bool TransformMethod(void* method);
 
     // Value boxing, wraps a value type (int, bool, etc.) in a managed object
+    // Unguarded - mono_value_box reads instance_size-4 bytes from valuePtr regardless of how much is actually there
+    // Prefer BoxValueChecked when the source is a fixed-size slot
     void* BoxValue(void* klass, void* valuePtr);
+
+    // Bytes mono_value_box will read from the source for this klass (instance_size - 4), or 0 if the size cannot be established
+    // 0 means unknown, not zero-sized
+    static uint32_t GetBoxPayloadSize(void* klass);
+
+    // Box a value whose payload lives in availableBytes of readable storage
+    // Returns null rather than over-reading when the class is provably larger, and logs the refusal tagged with `site`
+    // An unknown payload size falls through to the unguarded box
+    void* BoxValueChecked(void* klass, void* valuePtr, uint32_t availableBytes, const char* site);
+
+    // Offset of the payload inside a boxed value type
+    // The MonoObject header is 4 bytes, so mono_value_box writes to boxed+4 and CacheAPI unboxes at +4
+    static constexpr uint32_t BOXED_PAYLOAD_OFFSET = 4;
+
+    // One interpreter stackval slot
+    // Values returned through MonoInvokeState::pRet live in a single slot, and anything wider stays on the vt side-stack, which is not mapped
+    static constexpr uint32_t STACKVAL_SLOT_BYTES = 8;
 
     // Get the raw invoke function pointer (for hot-reload pre-compilation)
     using InvokeFunc = void(__cdecl*)(void* state);
@@ -143,6 +162,11 @@ class MonoBridge {
 
     // Get all cached images (call InitializeAllImages first)
     const std::vector<void*>& GetAllImages() const { return m_cachedImages; }
+
+    // Fresh walk of Mono's loaded_assemblies GList, including game-loaded .package mods
+    // GetAllImages() is a one-time startup snapshot, this re-enumerates on every call so it picks up assemblies loaded after startup, e.g. world-load script mods like NRaas
+    // Returns image pointers and leaves the cache untouched
+    std::vector<void*> EnumerateLoadedImagesFresh() const;
 
     // Moved: assembly_hooks.h, modding/conflict_detector.h, modding/vanilla_extractor.h
 
@@ -237,7 +261,11 @@ class MonoBridge {
 
     // MINT bytecode preparation. create_runtime_method returns RuntimeMethod*, transform returns 0 on success.
     using mono_interp_create_runtime_method_t = void*(__cdecl*)(void* method);
-    using interp_transform_method_t = int(__cdecl*)(void* runtimeMethod);
+    // 2-arg __cdecl - mono_interp_transform_method(rtm, threadCtx)
+    // param_2 is the thread-context block transform writes its frame and jmpBuf slots through (ctx+0xc, ctx+0x10), it is not read from TLS
+    // Omitting it makes transform write through an uninitialized [esp+8] stack slot, an RTC #2 stack smash
+    // See TransformWithSEH and engine ref FUN_00e52b90
+    using interp_transform_method_t = int(__cdecl*)(void* runtimeMethod, void* threadCtx);
 
     // Method header access, returns MonoMethodHeader* containing IL bytecode
     using mono_method_get_header_t = void*(__cdecl*)(void* method);

@@ -43,6 +43,7 @@ struct MonoMethods {
     uintptr_t interp_exec_state = 0;                      // 00e53eb0: main interpreter dispatch loop (~28KB)
     uintptr_t SPEC_mono_interp_create_runtime_method = 0; // 00e51f20: RuntimeMethod* create_runtime_method(MonoMethod*): get-or-create, caches at MonoMethod+0x14, allocates from domain->mp (0x48 bytes)
     uintptr_t SPEC_interp_transform_method = 0;           // 00e52b60: int transform(RuntimeMethod*): 0 = success; checks RTM+0x44 & 0x100 (transformed flag), pulls thread ctx from TLS, calls mono_interp_transform_method
+    uintptr_t SPEC_interp_add_data_item = 0;              // 00e5bcd0: u16 add_data_item(td=ESI, value=EBX) -> dedup index in EAX; appends resolved callee RTM/class/field to td->data_items (consumed by MINT_CALL 0xF1)
 };
 
 // MONO RUNTIME - Fields
