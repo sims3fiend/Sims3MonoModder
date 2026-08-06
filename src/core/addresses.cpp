@@ -149,6 +149,18 @@ static const CallSite s_domainGetSites[] = {
     SITE_ABS(Globals.g_mono_domain_tls_index, "Globals.g_mono_domain_tls_index", 0x01), // 00e75261 -> 0x011959DC
 };
 
+// mono_assembly_unref @ 0x00E67EF0 (assert "assembly != NULL", assembly.c:0x92a)
+// +0x62: 8B 0D <g_loaded_assemblies>  (MOV ECX, [imm32])
+static const CallSite s_assemblyUnrefSites[] = {
+    SITE_ABS(Globals.g_loaded_assemblies, "Globals.g_loaded_assemblies", 0x64), // 00e67f54 -> 0x011F422C
+};
+
+// mono_add_internal_call @ 0x00E82550
+// +0x16: 8B 15 <g_icall_hash_table>  (MOV EDX, [imm32])
+static const CallSite s_addInternalCallSites[] = {
+    SITE_ABS(InternalCalls.g_icall_hash_table, "InternalCalls.g_icall_hash_table", 0x18), // 00e82568 -> 0x011F436C
+};
+
 // mono_init_internal @ 0x00E75BF0
 // Calls mono_class_from_name for each built-in type, stores result via A3 (MOV [imm32], EAX).
 // Each A3 store is preceded by an assertion string "mono_defaults.XXX_class != 0".
@@ -185,6 +197,8 @@ static const CallSiteExtractor s_extractors[] = {
     {"mono_profiler_allocation", "F6 05 ?? ?? ?? ?? 80 74 ?? A1 ?? ?? ?? ?? 85 C0 74", 0, s_profilerAllocationSites, COUNTOF(s_profilerAllocationSites)},
     {"ScriptHost_InitHeap", "83 3D ?? ?? ?? ?? 00 74 ?? B0 01 C3 57 8B 3D", 0, s_initHeapSites, COUNTOF(s_initHeapSites)},
     {"mono_domain_get", "A1 ?? ?? ?? ?? 50 FF 15 ?? ?? ?? ?? C3", 0, s_domainGetSites, COUNTOF(s_domainGetSites)},
+    {"mono_assembly_unref", "57 8B 7C 24 08 85 FF 75 ?? 68 ?? ?? ?? ?? 68 2A 09 00 00", 0, s_assemblyUnrefSites, COUNTOF(s_assemblyUnrefSites)},
+    {"mono_add_internal_call", "E8 ?? ?? ?? ?? 8B 44 24 08 8B 4C 24 04 6A 00 50 51 E8", 0, s_addInternalCallSites, COUNTOF(s_addInternalCallSites)},
     {"mono_init_internal", "83 EC 18 53 55 56 33 ED 33 DB 39 2D", 0, s_monoInitInternalSites, COUNTOF(s_monoInitInternalSites)},
 };
 
@@ -245,6 +259,7 @@ static AddressEntry s_entries[] = {
     // Internal Calls
     ADDR(InternalCalls.mono_add_internal_call, "E8 ?? ?? ?? ?? 8B 44 24 08 8B 4C 24 04 6A 00 50 51 E8", 0, 0x00E82550, false),
     ADDR(InternalCalls.mono_lookup_internal_call, "81 EC 08 08 00 00 53 55 8B AC 24 14 08", 0, 0x00E82680, false),
+    ADDR(InternalCalls.g_icall_hash_table, nullptr, 0, 0x011F436C, false), // extracted (abs): mono_add_internal_call+0x18
 
     // Assemblies
     ADDR(Assemblies.mono_assembly_open_full, "83 EC 08 55 8B 6C 24 10 85 ED 75 ?? 68", 0, 0x00E68590, true),
@@ -273,6 +288,7 @@ static AddressEntry s_entries[] = {
     // Globals
     ADDR(Globals.g_ScriptVM, nullptr, 0, 0x011EE514, false),              // extracted (abs): ScriptHost_InitHeap+0x02
     ADDR(Globals.g_mono_domain_tls_index, nullptr, 0, 0x011959DC, false), // extracted (abs): mono_domain_get+0x01
+    ADDR(Globals.g_loaded_assemblies, nullptr, 0, 0x011F422C, false),     // extracted (abs): mono_assembly_unref+0x64
 
     // MonoDefaults - primitive types only (12 of 62)
     // Extracted from mono_init_internal; fallback = global address of mono_defaults field

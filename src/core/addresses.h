@@ -71,6 +71,7 @@ struct MonoCustomAttrs {
 struct MonoInternalCalls {
     uintptr_t mono_add_internal_call = 0;
     uintptr_t mono_lookup_internal_call = 0;
+    uintptr_t g_icall_hash_table = 0; // *(GHashTable**)addr = icall registry
 };
 
 // MONO RUNTIME - Assembly Loading
@@ -107,6 +108,7 @@ struct MonoProfiler {
 struct MonoGlobals {
     uintptr_t g_ScriptVM = 0;              // *(void**)addr = MonoScriptHost*
     uintptr_t g_mono_domain_tls_index = 0; // TLS index used by mono_domain_get
+    uintptr_t g_loaded_assemblies = 0;     // *(GList**)addr = loaded assembly list
 };
 
 // MONO RUNTIME - mono_defaults (subset)

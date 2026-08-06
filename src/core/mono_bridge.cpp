@@ -11,7 +11,6 @@ namespace S3MM {
 
 // Hooks, conflict detection, vanilla extraction, and assembly diffing live in separate modules (assembly_hooks, package_reader, il_parser, conflict_detector, vanilla_extractor, assembly_diff).
 
-// HARDCODED ADDRESSES - Sims 3 Steam version
 #define g_ScriptVM (*(void**)Addresses::Globals.g_ScriptVM)
 #define MONO_DOMAIN_TLS_INDEX_ADDR Addresses::Globals.g_mono_domain_tls_index
 
@@ -807,8 +806,8 @@ int MonoBridge::GetTypeDefCount(void* image) {
 void MonoBridge::DumpIcallTable() {
     LOG_INFO("=== DUMPING ICALL HASH TABLE ===");
 
-    // EA icall hash table global at 0x011f436c
-    constexpr uintptr_t ICALL_HASH_TABLE_ADDR = 0x011f436c;
+    // EA icall hash table global (pattern-scanned now :)))
+    const uintptr_t ICALL_HASH_TABLE_ADDR = Addresses::InternalCalls.g_icall_hash_table;
 
     void* hashTable = *(void**)ICALL_HASH_TABLE_ADDR;
     LOG_INFO("[Icall] Hash table ptr @ " + ToHex(ICALL_HASH_TABLE_ADDR) + " = " + ToHex((uintptr_t)hashTable));
@@ -939,8 +938,8 @@ static std::string ProbeStringSafe(void* base, int offset, int maxLen = 20) {
 // Callers see assemblies that loaded after the one-time InitializeAllImages snapshot, e.g. on world-load script mods
 std::vector<void*> MonoBridge::EnumerateLoadedImagesFresh() const {
     std::vector<void*> images;
-    constexpr uintptr_t LOADED_ASSEMBLIES_ADDR = 0x011f422c; // GList* (same global InitializeAllImages walks)
-    constexpr int ASSEMBLY_IMAGE_OFFSET = 0x44;              // MonoAssembly+0x44 = MonoImage*
+    const uintptr_t LOADED_ASSEMBLIES_ADDR = Addresses::Globals.g_loaded_assemblies; // GList* (same global InitializeAllImages walks)
+    constexpr int ASSEMBLY_IMAGE_OFFSET = 0x44;                                      // MonoAssembly+0x44 = MonoImage*
 
     void* listHead = *(void**)LOADED_ASSEMBLIES_ADDR;
     if (!listHead || !IsValidPointer(listHead)) return images;
@@ -971,10 +970,9 @@ void MonoBridge::InitializeAllImages() {
     m_cachedImages.clear();
     std::set<void*> seenImages;
 
-    // loaded_assemblies global at 0x011f422c (GList*)
     // GList: { void* data, GList* next, GList* prev }
     // MonoAssembly+0x44 = MonoImage*
-    constexpr uintptr_t LOADED_ASSEMBLIES_ADDR = 0x011f422c;
+    const uintptr_t LOADED_ASSEMBLIES_ADDR = Addresses::Globals.g_loaded_assemblies;
     constexpr int ASSEMBLY_IMAGE_OFFSET = 0x44;
 
     void* listHead = *(void**)LOADED_ASSEMBLIES_ADDR;
