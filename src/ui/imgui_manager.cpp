@@ -65,7 +65,14 @@ bool ImGuiManager::Initialize() {
         d3dpp.hDeviceWindow = dummyWnd;
 
         IDirect3DDevice9* pDevice = nullptr;
-        HRESULT hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, d3dpp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDevice);
+        // Thank u previous me in S3SS xoxo
+        // We only need the vtable (implemented by the d3d9 runtime, identical across device types), and a HAL device drags the whole GPU user-mode driver into the process just to be thrown away :D LOVE THAT YAAAAY
+        HRESULT hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_NULLREF, d3dpp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDevice);
+        if (FAILED(hr) || !pDevice) {
+            // Some setups might reject NULLREF so fall back to HAL rather than losing the overlay entirely
+            LOG_WARN("[Init] NULLREF device creation failed, falling back to HAL");
+            hr = pD3D->CreateDevice(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, d3dpp.hDeviceWindow, D3DCREATE_SOFTWARE_VERTEXPROCESSING, &d3dpp, &pDevice);
+        }
 
         if (FAILED(hr) || !pDevice) {
             LOG_ERROR("[ImGuiManager] Failed to create D3D device");
