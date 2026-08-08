@@ -31,7 +31,8 @@ class MonoBridge {
 
     // String operations
     void* CreateString(const char* utf8);
-    std::string ExtractString(void* monoString);
+    // maxLength guards against a garbage length field on a bad pointer; raw data channel (S3MM.Log.Raw) passes a higher bound if you need it
+    std::string ExtractString(void* monoString, int32_t maxLength = 4096);
 
     // Class lookup
     void* GetClassByName(const char* nameSpace, const char* className);

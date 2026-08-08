@@ -689,6 +689,14 @@ namespace S3MM
         /// <summary>Log a debug message (only visible when debug logging is enabled).</summary>
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern void Debug(string message);
+
+        /// <summary>
+        /// Write a string to the S3MM log file as a data channel with no length cap
+        /// One call produces one line: "[ModName] " followed by the string, plus a trailing newline. Not shown in the Mods panel.
+        /// Note: the string must not contain embedded newlines if you need line-based reassembly.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern void Raw(string message);
     }
 
     /// <summary>

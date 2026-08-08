@@ -139,6 +139,7 @@ class HookManager {
     static void __cdecl NativeLogWarn(void* messageStr);
     static void __cdecl NativeLogError(void* messageStr);
     static void __cdecl NativeLogDebug(void* messageStr);
+    static void __cdecl NativeLogRaw(void* messageStr);
 
     // Chain dispatch - entry point for instance method hooks via InstanceDispatch stubs
     static void* __cdecl NativeDispatch(uint32_t methodToken, void* thisPtr, void* argsArray);

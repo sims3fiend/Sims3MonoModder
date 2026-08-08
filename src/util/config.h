@@ -30,6 +30,10 @@ class Config {
     bool IsVerbose() const;
     void SetVerbose(bool verbose);
 
+    // Hook invocation logging: per-invocation HookManager trace lines (hot paths). Off by default, independent of Verbose.
+    bool IsLogHookInvocations() const;
+    void SetLogHookInvocations(bool enabled);
+
     // Key name helper for display
     static std::string GetKeyName(UINT vkCode);
 
@@ -51,6 +55,7 @@ class Config {
     std::string m_theme = "Visual Studio"; // Default theme
     int m_fontSize = 13;                   // Explicit px (native = 13)
     bool m_verbose = false;                // Verbose (Debug-level) logging; off by default
+    bool m_logHookInvocations = false;     // Per-invocation hook invocation logging; off by default
     bool m_initialized = false;
 };
 

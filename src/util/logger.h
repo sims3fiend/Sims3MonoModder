@@ -5,6 +5,7 @@
 #include <sstream>
 #include <iomanip>
 #include <chrono>
+#include <atomic>
 
 namespace S3MM {
 
@@ -47,7 +48,32 @@ class Logger {
     }
 
     void Log(Level level, const std::string& message) {
-        if (level < m_minLevel) return;
+        if (level < m_minLevel.load(std::memory_order_relaxed)) return;
+        Write(level, message);
+    }
+
+    // Per-invocation hook invocation logging, gated on the LogHookInvocations config flag alone (independent of the min level, so it works without full Verbose)
+    void LogHookTrace(const std::string& message) {
+        if (!m_logHookInvocations.load(std::memory_order_relaxed)) return;
+        Write(Level::Debug, message);
+    }
+
+    // Raw data channel for mods (S3MM.Log.Raw): verbatim write, no timestamp/tag, no level gate, no trimming
+    void LogRaw(const std::string& message) {
+        if (!m_initialized || !m_csInitialized) return;
+
+        EnterCriticalSection(&m_cs);
+        if (!m_initialized) {
+            LeaveCriticalSection(&m_cs);
+            return;
+        }
+
+        m_file << message << std::endl;
+        LeaveCriticalSection(&m_cs);
+    }
+
+  private:
+    void Write(Level level, const std::string& message) {
         if (!m_initialized || !m_csInitialized) return;
 
         EnterCriticalSection(&m_cs);
@@ -63,13 +89,11 @@ class Logger {
         std::tm tm_buf;
         localtime_s(&tm_buf, &time);
 
+        // std::endl flushes; do NOT add a second flush here (a double flush per line was murder on hot paths)
         m_file << std::put_time(&tm_buf, "%H:%M:%S") << '.' << std::setfill('0') << std::setw(3) << ms.count() << " [" << LevelToString(level) << "] " << message << std::endl;
-
-        m_file.flush();
         LeaveCriticalSection(&m_cs);
     }
 
-  private:
     Logger() = default;
     ~Logger() {
         Shutdown();
@@ -78,8 +102,14 @@ class Logger {
 
   public:
     // Minimum level gate. Release defaults to Info (DEBUG suppressed); opt back in via Config "Verbose".
-    void SetMinLevel(Level level) { m_minLevel = level; }
-    Level GetMinLevel() const { return m_minLevel; }
+    // Atomic: read on every log call from any thread, written from the UI/config thread.
+    void SetMinLevel(Level level) { m_minLevel.store(level, std::memory_order_relaxed); }
+    Level GetMinLevel() const { return m_minLevel.load(std::memory_order_relaxed); }
+    bool IsLevelEnabled(Level level) const { return level >= m_minLevel.load(std::memory_order_relaxed); }
+
+    // Per-invocation hook invocation logging gate (Config "LogHookInvocations", default off)
+    void SetLogHookInvocations(bool enabled) { m_logHookInvocations.store(enabled, std::memory_order_relaxed); }
+    bool IsLogHookInvocationsEnabled() const { return m_logHookInvocations.load(std::memory_order_relaxed); }
 
   private:
     static const char* LevelToString(Level level) {
@@ -101,18 +131,37 @@ class Logger {
     CRITICAL_SECTION m_cs;
     bool m_csInitialized = false;
     bool m_initialized = false;
+    std::atomic<bool> m_logHookInvocations{false}; // Config "LogHookInvocations" - per-invocation hook invocation logging, off by default
 #ifdef NDEBUG
-    Level m_minLevel = Level::Info; // Release: suppress DEBUG by default (Config "Verbose" re-enables)
+    std::atomic<Level> m_minLevel{Level::Info}; // Release: suppress DEBUG by default (Config "Verbose" re-enables)
 #else
-    Level m_minLevel = Level::Debug; // Debug builds: full verbosity
+    std::atomic<Level> m_minLevel{Level::Debug}; // Debug builds: full verbosity
 #endif
 };
 
-// LOGGING MACROS
-#define LOG_DEBUG(msg) S3MM::Logger::Get().Log(S3MM::Logger::Level::Debug, msg)
-#define LOG_INFO(msg) S3MM::Logger::Get().Log(S3MM::Logger::Level::Info, msg)
-#define LOG_WARN(msg) S3MM::Logger::Get().Log(S3MM::Logger::Level::Warning, msg)
-#define LOG_ERROR(msg) S3MM::Logger::Get().Log(S3MM::Logger::Level::Error, msg)
+// LOGGING MACROS - level-checked before the message expression is evaluated, so suppressed logging never builds the string
+#define LOG_DEBUG(msg)                                                           \
+    do {                                                                         \
+        if (S3MM::Logger::Get().IsLevelEnabled(S3MM::Logger::Level::Debug)) { S3MM::Logger::Get().Log(S3MM::Logger::Level::Debug, msg); } \
+    } while (0)
+#define LOG_INFO(msg)                                                           \
+    do {                                                                        \
+        if (S3MM::Logger::Get().IsLevelEnabled(S3MM::Logger::Level::Info)) { S3MM::Logger::Get().Log(S3MM::Logger::Level::Info, msg); } \
+    } while (0)
+#define LOG_WARN(msg)                                                              \
+    do {                                                                           \
+        if (S3MM::Logger::Get().IsLevelEnabled(S3MM::Logger::Level::Warning)) { S3MM::Logger::Get().Log(S3MM::Logger::Level::Warning, msg); } \
+    } while (0)
+#define LOG_ERROR(msg)                                                           \
+    do {                                                                         \
+        if (S3MM::Logger::Get().IsLevelEnabled(S3MM::Logger::Level::Error)) { S3MM::Logger::Get().Log(S3MM::Logger::Level::Error, msg); } \
+    } while (0)
+
+// Per-invocation hook invocation logging (hot paths in HookManager). Gated on Config "LogHookInvocations" alone, emits at DEBUG level.
+#define LOG_HOOK_TRACE(msg)                                       \
+    do {                                                          \
+        if (S3MM::Logger::Get().IsLogHookInvocationsEnabled()) { S3MM::Logger::Get().LogHookTrace(msg); } \
+    } while (0)
 
 // HEX FORMATTING HELPER
 inline std::string ToHex(uintptr_t value) {

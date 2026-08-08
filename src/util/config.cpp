@@ -66,10 +66,15 @@ void Config::Initialize() {
             m_verbose = *v;
             LOG_INFO("[Config] Verbose = " + std::string(m_verbose ? "true" : "false"));
         }
+        if (auto v = tbl["LogHookInvocations"].value<bool>()) {
+            m_logHookInvocations = *v;
+            LOG_INFO("[Config] LogHookInvocations = " + std::string(m_logHookInvocations ? "true" : "false"));
+        }
     } catch (const toml::parse_error& err) { LOG_INFO("[Config] Could not parse config (" + std::string(err.what()) + "), using defaults"); }
 
     // Apply verbose flag to logger. Note: config loads after Logger::Initialize, so the earliest startup lines (address resolution, image hooks) already emitted at the build default
     if (m_verbose) { Logger::Get().SetMinLevel(Logger::Level::Debug); }
+    Logger::Get().SetLogHookInvocations(m_logHookInvocations);
 
     m_initialized = true;
     LOG_INFO("[Config] Loaded successfully");
@@ -92,6 +97,7 @@ void Config::Save() {
     tbl.insert("Theme", m_theme);
     tbl.insert("FontSize", static_cast<int64_t>(m_fontSize));
     tbl.insert("Verbose", m_verbose);
+    tbl.insert("LogHookInvocations", m_logHookInvocations);
     file << tbl;
 
     LOG_INFO("[Config] Saved successfully");
@@ -156,6 +162,22 @@ void Config::SetVerbose(bool verbose) {
     // Explicit runtime toggle. on -> Debug, off -> Info (applies regardless of build type).
     Logger::Get().SetMinLevel(verbose ? Logger::Level::Debug : Logger::Level::Info);
     LOG_INFO("[Config] Verbose logging " + std::string(verbose ? "enabled" : "disabled"));
+    Save();
+}
+
+bool Config::IsLogHookInvocations() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_logHookInvocations;
+}
+
+void Config::SetLogHookInvocations(bool enabled) {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_logHookInvocations == enabled) return;
+        m_logHookInvocations = enabled;
+    }
+    Logger::Get().SetLogHookInvocations(enabled);
+    LOG_INFO("[Config] Hook invocation logging " + std::string(enabled ? "enabled" : "disabled"));
     Save();
 }
 

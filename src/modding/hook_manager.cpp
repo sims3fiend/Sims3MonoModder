@@ -122,6 +122,7 @@ bool HookManager::Initialize() {
     MonoBridge::Get().AddInternalCall("S3MM.Log::Warn", (void*)&HookManager::NativeLogWarn);
     MonoBridge::Get().AddInternalCall("S3MM.Log::Error", (void*)&HookManager::NativeLogError);
     MonoBridge::Get().AddInternalCall("S3MM.Log::Debug", (void*)&HookManager::NativeLogDebug);
+    MonoBridge::Get().AddInternalCall("S3MM.Log::Raw", (void*)&HookManager::NativeLogRaw);
 
     MonoBridge::Get().AddInternalCall("S3MM.Native::Dispatch", (void*)&HookManager::NativeDispatch);
     MonoBridge::Get().AddInternalCall("S3MM.InstanceDispatch::SetCurrentToken", (void*)&HookManager::NativeSetCurrentToken);
@@ -1933,7 +1934,7 @@ void* HookManager::ContinueBakedChain(void* originalMethod, size_t fromLinkIndex
 
 // INVOKE ORIGINAL - Call the trampoline to execute unhooked original IL
 void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** params) {
-    LOG_DEBUG("[HookManager] InvokeOriginal: method=" + std::to_string((uintptr_t)originalMethod));
+    LOG_HOOK_TRACE("[HookManager] InvokeOriginal: method=" + std::to_string((uintptr_t)originalMethod));
 
     auto* chain = GetChain(originalMethod);
     if (!chain) {
@@ -1941,7 +1942,7 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
         return nullptr;
     }
 
-    LOG_DEBUG("[HookManager] InvokeOriginal: found chain for " + chain->targetClass + "::" + chain->targetMethod);
+    LOG_HOOK_TRACE("[HookManager] InvokeOriginal: found chain for " + chain->targetClass + "::" + chain->targetMethod);
 
     // Use the heap-allocated trampoline that was created during backup (it has the original token/klass/runtimeMethod values).
     if (!chain->trampolineMethod) {
@@ -1952,7 +1953,7 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
     auto* trampoline = reinterpret_cast<MonoMethodLayout*>(chain->trampolineMethod);
     bool needsCompile = (trampoline->runtimeMethod == nullptr);
 
-    LOG_DEBUG("[HookManager] InvokeOriginal: using trampoline=" + std::to_string((uintptr_t)trampoline) + ", token=" + std::to_string(trampoline->token) +
+    LOG_HOOK_TRACE("[HookManager] InvokeOriginal: using trampoline=" + std::to_string((uintptr_t)trampoline) + ", token=" + std::to_string(trampoline->token) +
               ", runtime=" + std::to_string((uintptr_t)trampoline->runtimeMethod) + (needsCompile ? " (first-time compile)" : ""));
 
     // Ensure TLS is set up for Mono operations
@@ -1962,12 +1963,12 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
     MonoInvokeState state = {};
     bool invokeResult = MonoBridge::Get().InvokeMethod(chain->trampolineMethod, thisPtr, params, &state);
 
-    LOG_DEBUG("[HookManager] InvokeOriginal: invoke returned " + std::to_string(invokeResult) + ", pRet=" + std::to_string((uintptr_t)state.pRet) + ", pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
+    LOG_HOOK_TRACE("[HookManager] InvokeOriginal: invoke returned " + std::to_string(invokeResult) + ", pRet=" + std::to_string((uintptr_t)state.pRet) + ", pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
 
     // If the trampoline was compiled during this call, update it
     if (trampoline->runtimeMethod && !chain->originalRuntimeMethod) {
         chain->originalRuntimeMethod = trampoline->runtimeMethod;
-        LOG_DEBUG("[HookManager] InvokeOriginal: captured new runtimeMethod=" + std::to_string((uintptr_t)trampoline->runtimeMethod));
+        LOG_HOOK_TRACE("[HookManager] InvokeOriginal: captured new runtimeMethod=" + std::to_string((uintptr_t)trampoline->runtimeMethod));
     }
 
     // WORKAROUND: Mono 1.2 interpreter has a bug where first-time compilation + execution of a trampoline can fail, but the compilation side-effect persists.
@@ -1979,7 +1980,7 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
         memset(&state, 0, sizeof(state));
         invokeResult = MonoBridge::Get().InvokeMethod(chain->trampolineMethod, thisPtr, params, &state);
 
-        LOG_DEBUG("[HookManager] InvokeOriginal: retry returned " + std::to_string(invokeResult) + ", pRet=" + std::to_string((uintptr_t)state.pRet) + ", pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
+        LOG_HOOK_TRACE("[HookManager] InvokeOriginal: retry returned " + std::to_string(invokeResult) + ", pRet=" + std::to_string((uintptr_t)state.pRet) + ", pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
     }
 
     // Use cached signature info to avoid re-reading signature every call. Ensure signature is cached (should already be from BackupOriginalMethod).
@@ -1996,7 +1997,7 @@ void* HookManager::BoxInvokeResult(HookChain* chain, MonoInvokeState& state, con
     const std::string tag = std::string("[HookManager] ") + (site ? site : "?") + ": ";
     MonoTypeCode typeCode = chain ? chain->cachedReturnType : MonoTypeCode::Object;
 
-    LOG_DEBUG(
+    LOG_HOOK_TRACE(
         tag + "typeCode=" + std::to_string((int)typeCode) + ", isObject=" + std::to_string(state.isObject) + ", pRet=" + std::to_string((uintptr_t)state.pRet) + ", pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
 
     // FAST PATH: void return - nothing to return
@@ -2006,7 +2007,7 @@ void* HookManager::BoxInvokeResult(HookChain* chain, MonoInvokeState& state, con
     // The interpreter sets isObject=1 for reference types, isObject=0 for value types.
     // This is more reliable than type code matching, especially for private nested classes, generic instantiations, and edge cases in type resolution.
     if (state.isObject) {
-        LOG_DEBUG(tag + "isObject=1, returning pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
+        LOG_HOOK_TRACE(tag + "isObject=1, returning pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
         return state.pRetVal;
     }
 
@@ -2018,7 +2019,7 @@ void* HookManager::BoxInvokeResult(HookChain* chain, MonoInvokeState& state, con
     // VALUE-TYPE RETURN, PRE-BOXED BY THE RUNTIME - the invoke setup pre-allocates the box and points pRet at its payload (box+0x4)
     // => pRetVal is the authoritative, already-filled boxed result, re-boxing from pRet is wrong for >8-byte structs
     if (state.pRetVal) {
-        LOG_DEBUG(tag + "value-type return: using the runtime's pre-boxed pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
+        LOG_HOOK_TRACE(tag + "value-type return: using the runtime's pre-boxed pRetVal=" + std::to_string((uintptr_t)state.pRetVal));
         return state.pRetVal;
     }
 
@@ -2042,7 +2043,7 @@ void* HookManager::BoxInvokeResult(HookChain* chain, MonoInvokeState& state, con
         }
         // Cache it for next time
         chain->cachedReturnKlass = valueKlass;
-        LOG_DEBUG(tag + "cached primitive klass=" + std::to_string((uintptr_t)valueKlass));
+        LOG_HOOK_TRACE(tag + "cached primitive klass=" + std::to_string((uintptr_t)valueKlass));
     }
 
     // pRet points to the raw value bytes
@@ -2055,7 +2056,7 @@ void* HookManager::BoxInvokeResult(HookChain* chain, MonoInvokeState& state, con
     // A primitive's payload is <= 8 bytes (one slot), but alignment padding can inflate its boxed instance_size (System.Double: [4 header][4 pad][8 data] = 16, so instance_size-4 = 12 would falsely trip a flat size guard)
     // The guard is reserved for genuinely wide structs (e.g. a 16-byte ResourceKey), whose payload lives on the interpreter vt side-stack, not in a single slot
     void* boxedValue = chain->returnIsPrimitive ? MonoBridge::Get().BoxValue(valueKlass, state.pRet) : MonoBridge::Get().BoxValueChecked(valueKlass, state.pRet, MonoBridge::STACKVAL_SLOT_BYTES, site);
-    LOG_DEBUG(tag + "boxed value = " + std::to_string((uintptr_t)boxedValue));
+    LOG_HOOK_TRACE(tag + "boxed value = " + std::to_string((uintptr_t)boxedValue));
 
     return boxedValue;
 }
@@ -2191,7 +2192,7 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
     // FAST PATH: Single-entry chain (the lone entry may be a hook OR a watcher - watchers live in chain.hooks too), first call.
     // That entry is hook[0], already invoked by the dispatch stub before it called us, so nothing is skipped - skip chain state, go straight to trampoline.
     if (isNewChain && chain->hooks.size() == 1) {
-        LOG_DEBUG("[HookManager] NativeCallNext: FAST PATH for single-entry chain " + chain->targetClass + "::" + chain->targetMethod);
+        LOG_HOOK_TRACE("[HookManager] NativeCallNext: FAST PATH for single-entry chain " + chain->targetClass + "::" + chain->targetMethod);
 
         // Unbox params and invoke trampoline directly
         std::vector<void*> unboxedParams = UnboxParametersFast(argsArray, chain);
@@ -2225,7 +2226,7 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
         // Re-fetch state after push to get current values
         state = FindChainState(methodToken);
 
-        LOG_DEBUG("[HookManager] NativeCallNext: started chain for " + chain->targetClass + "::" + chain->targetMethod + " (" + std::to_string(chain->hooks.size()) + " hooks, " + std::to_string(chain->watchers.size()) +
+        LOG_HOOK_TRACE("[HookManager] NativeCallNext: started chain for " + chain->targetClass + "::" + chain->targetMethod + " (" + std::to_string(chain->hooks.size()) + " hooks, " + std::to_string(chain->watchers.size()) +
                   " watchers)");
     } else {
         // Existing chain, nested CallNext call
@@ -2253,7 +2254,7 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
         state->nextHookIndex++;
         const HookEntry& nextHook = chain->hooks[nextIdx];
 
-        LOG_DEBUG("[HookManager] NativeCallNext: invoking hook[" + std::to_string(nextIdx) + "] from " + nextHook.modName);
+        LOG_HOOK_TRACE("[HookManager] NativeCallNext: invoking hook[" + std::to_string(nextIdx) + "] from " + nextHook.modName);
 
         // Ensure TLS is set up for Mono operations
         MonoBridge::Get().SetupTLS();
@@ -2286,7 +2287,7 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
         result = invokeState.pRetVal ? invokeState.pRetVal : invokeState.pRet;
     } else {
         // No more hooks - invoke the actual original (trampoline)
-        LOG_DEBUG("[HookManager] NativeCallNext: invoking trampoline");
+        LOG_HOOK_TRACE("[HookManager] NativeCallNext: invoking trampoline");
         // WARNING WEEE WOOO WEE WOO: after this call, 'state' pointer may be invalid due to vector reallocation
         result = mgr.InvokeOriginal(originalMethod, cachedThisPtr, cachedParams);
     }
@@ -2306,7 +2307,7 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
         if (!t_chainStack.empty() && t_chainStack.back().methodToken == methodToken) { t_chainStack.pop_back(); }
         // Mark guard complete so destructor doesn't double-pop
         guard.MarkComplete();
-        LOG_DEBUG("[HookManager] NativeCallNext: chain complete, returning result");
+        LOG_HOOK_TRACE("[HookManager] NativeCallNext: chain complete, returning result");
     }
 
     return result;
@@ -2480,6 +2481,16 @@ void __cdecl HookManager::NativeLogDebug(void* messageStr) {
     ModLog::Get().Log(source, message, LogLevel::Debug);
 }
 
+// RAW LOG - Data channel for mods (S3MM.Log.Raw). No length cap (1M sanity bound), no timestamp/level tag, payload verbatim,
+// but each line is prefixed with [ModName] so payload lines are attributable and filterable in the shared S3MM.log.
+// Deliberately NOT mirrored into the ModLog ring (it evicts at 1000 entries - lossy for bulk data)
+void __cdecl HookManager::NativeLogRaw(void* messageStr) {
+    if (!messageStr) return;
+    std::string message = MonoBridge::Get().ExtractString(messageStr, 1 << 20);
+    std::string source = ResolveCallerAssemblyName();
+    S3MM::Logger::Get().LogRaw("[" + source + "] " + message);
+}
+
 // NATIVE DISPATCH - Entry point for instance method hooks, starts chain from hook[0]
 void* __cdecl HookManager::NativeDispatch(uint32_t methodToken, void* thisPtr, void* argsArray) {
     auto& mgr = HookManager::Get();
@@ -2519,7 +2530,7 @@ void* __cdecl HookManager::NativeDispatch(uint32_t methodToken, void* thisPtr, v
     // NOTE: newState is moved-from after this point, read from stack entry instead
     auto& stackEntry = t_chainStack.back();
 
-    LOG_DEBUG("[HookManager] NativeDispatch: starting chain for " + chain->targetClass + "::" + chain->targetMethod + " (" + std::to_string(chain->hooks.size()) + " hooks)");
+    LOG_HOOK_TRACE("[HookManager] NativeDispatch: starting chain for " + chain->targetClass + "::" + chain->targetMethod + " (" + std::to_string(chain->hooks.size()) + " hooks)");
 
     // Invoke hook[0]
     const HookEntry& firstHook = chain->hooks[0];
@@ -2555,7 +2566,7 @@ void* __cdecl HookManager::NativeDispatch(uint32_t methodToken, void* thisPtr, v
     // Clean up chain state
     if (!t_chainStack.empty() && t_chainStack.back().methodToken == methodToken) { t_chainStack.pop_back(); }
 
-    LOG_DEBUG("[HookManager] NativeDispatch: chain complete");
+    LOG_HOOK_TRACE("[HookManager] NativeDispatch: chain complete");
     return result;
 }
 
@@ -2563,7 +2574,7 @@ void* __cdecl HookManager::NativeDispatch(uint32_t methodToken, void* thisPtr, v
 void __cdecl HookManager::NativeSetCurrentToken(uint32_t token) {
     // This is called from managed code (InstanceDispatch.SetCurrentToken).
     // The token is stored in managed TLS, so nothing to do on native side. The function exists just to provide the internal call binding.
-    LOG_DEBUG("[HookManager] NativeSetCurrentToken: " + std::to_string(token));
+    LOG_HOOK_TRACE("[HookManager] NativeSetCurrentToken: " + std::to_string(token));
 }
 
 } // namespace S3MM

@@ -119,11 +119,11 @@ void* MonoBridge::CreateString(const char* utf8) {
     return str;
 }
 
-std::string MonoBridge::ExtractString(void* monoString) {
+std::string MonoBridge::ExtractString(void* monoString, int32_t maxLength) {
     if (!IsValidPointer(monoString)) return "<null>";
 
     int32_t length = *(int32_t*)((uintptr_t)monoString + Offsets::STRING_LENGTH);
-    if (length <= 0 || length > 4096) return "<invalid>";
+    if (length <= 0 || length > maxLength) return "<invalid>";
 
     wchar_t* chars = (wchar_t*)((uintptr_t)monoString + Offsets::STRING_CHARS);
     if (!IsValidPointer(chars)) return "<invalid>";
@@ -137,6 +137,21 @@ std::string MonoBridge::ExtractString(void* monoString) {
             result += (char)c;
         } else if (c < 0x800) {
             result += (char)(0xC0 | (c >> 6));
+            result += (char)(0x80 | (c & 0x3F));
+        } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < length) {
+            // Surrogate pair -> 4-byte UTF-8 (lone/unmatched surrogates fall through to 3-byte encoding)
+            uint16_t lo = (uint16_t)chars[i + 1];
+            if (lo >= 0xDC00 && lo <= 0xDFFF) {
+                uint32_t cp = 0x10000 + (((uint32_t)c - 0xD800) << 10) + ((uint32_t)lo - 0xDC00);
+                result += (char)(0xF0 | (cp >> 18));
+                result += (char)(0x80 | ((cp >> 12) & 0x3F));
+                result += (char)(0x80 | ((cp >> 6) & 0x3F));
+                result += (char)(0x80 | (cp & 0x3F));
+                i++;
+                continue;
+            }
+            result += (char)(0xE0 | (c >> 12));
+            result += (char)(0x80 | ((c >> 6) & 0x3F));
             result += (char)(0x80 | (c & 0x3F));
         } else {
             result += (char)(0xE0 | (c >> 12));
