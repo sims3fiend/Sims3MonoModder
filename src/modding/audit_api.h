@@ -44,6 +44,10 @@ class AuditAPI {
     // Returns string[] of loaded mod names, or nullptr if empty
     static void* __cdecl NativeGetLoadedMods();
 
+    // Returns string[] of "Class:Method - reason" for every refused hook install of the given mod, or nullptr if none
+    // Empty/null modName returns all mods' refusals, each prefixed "ModName: "
+    static void* __cdecl NativeGetRefusedHooks(void* modNameStr);
+
   private:
     // Lazily-built index for O(1) IsMethodHooked lookup
     static void RebuildClassMethodIndex();

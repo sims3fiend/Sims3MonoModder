@@ -182,6 +182,9 @@ bool ModManager::ProcessMods() {
         LOG_INFO("[ModManager] Post-OnLoad: reinstalled " + std::to_string(postOnLoadReinstalled) + " dispatch stubs, applied " + std::to_string(postOnLoadApplied) + " new chains");
     }
 
+    // Per-mod hook install summary - requested / installed / REFUSED with reasons
+    HookManager::Get().LogHookSummary();
+
     m_modsProcessed = true;
 
     LOG_INFO("[ModManager] ========================================");

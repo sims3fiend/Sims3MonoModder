@@ -462,6 +462,9 @@ void ModsPanel::ScanForNewMods() {
             if (postOnLoadReinstalled > 0 || postOnLoadApplied > 0) {
                 ModLog::Get().Log("[System]", "Post-OnLoad: reinstalled " + std::to_string(postOnLoadReinstalled) + " stubs, applied " + std::to_string(postOnLoadApplied) + " new chains");
             }
+
+            // Per-mod "requested / installed / REFUSED (reason)" roll-up, mirroring ProcessMods
+            hookManager.LogHookSummary();
         });
     }
 

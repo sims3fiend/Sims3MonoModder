@@ -1111,6 +1111,9 @@ bool ModLoader::HotReloadMod(const std::string& modName) {
         int postApplied = HookManager::Get().ApplyHooks();
         if (postReinstalled > 0 || postApplied > 0) { LOG_INFO("[ModLoader] Post-OnLoad: reinstalled " + std::to_string(postReinstalled) + " stub(s), applied " + std::to_string(postApplied) + " new chain(s)"); }
 
+        // Per-mod requested / installed / REFUSED roll-up for the reloaded mod
+        HookManager::Get().LogHookSummary();
+
         LOG_INFO("[ModLoader] Hot-reload complete: " + std::to_string(newHooks) + " hook(s), " + std::to_string(reinstalled) + " dispatch stub(s) reinstalled, " + std::to_string(newlyApplied) + " new chain(s) applied");
         reloadOk = true;
     });

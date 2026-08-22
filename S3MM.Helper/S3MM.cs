@@ -1248,5 +1248,21 @@ namespace S3MM
         /// </example>
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern string[] GetLoadedMods();
+
+        /// <summary>
+        /// Returns "Class:Method - reason" for every hook of <paramref name="modName"/> that S3MM refused to install
+        /// (signature/return-ABI mismatch, unhookable target, rejected typed entry), or null if none were refused.
+        /// Hook.Register cannot report this itself (refusal is decided at chain install time, and a loosely-typed
+        /// handler is legal at lower priority), so self-check at startup instead:
+        /// <code>
+        ///   string[] refused = S3MM.Audit.GetRefusedHooks("MyMod");
+        ///   if (refused != null)
+        ///       foreach (string r in refused) S3MM.Log.Error("Hook not installed: " + r);
+        /// </code>
+        /// The same refusals appear in the startup "Hook install summary" log block. Pass null/empty for all mods' refusals, prefixed "ModName: ".
+        /// </summary>
+        /// <param name="modName">Logical mod name (assembly name), or null/empty for all mods.</param>
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        public static extern string[] GetRefusedHooks(string modName);
     }
 }

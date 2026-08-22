@@ -110,6 +110,23 @@ class HookManager {
     // Reinstall dispatch stubs for chains that need updating (unlike ApplyHooks, updates already-patched chains too)
     int ReinstallDispatchStubs();
 
+    // Per-mod install diagnostics: requested count + refusal records, surfaced by LogHookSummary and Audit.GetRefusedHooks
+    struct HookRefusal {
+        std::string target; // "Class:Method"
+        std::string reason; // one-line refusal reason
+    };
+    struct ModHookStats {
+        int requested = 0;
+        std::vector<HookRefusal> refusals;
+    };
+
+    // Per-mod hook install summary block ("N requested, M installed, K REFUSED (reason)") - call after startup load, hot-reload, and runtime applies
+    // onlyIfNewRefusals = print only mods with refusals, and only when refusal records grew since the last summary
+    void LogHookSummary(bool onlyIfNewRefusals = false);
+
+    // Per-mod request/refusal records for Audit.GetRefusedHooks
+    const std::unordered_map<std::string, ModHookStats>& GetModHookStats() const { return m_modStats; }
+
     // Get a hook chain by target method
     HookChain* GetChain(void* originalMethod);
     HookChain* GetChainByName(const std::string& targetClass, const std::string& targetMethod);
@@ -241,6 +258,13 @@ class HookManager {
     static bool IsPrimitiveType(MonoTypeCode code) { return code >= MonoTypeCode::Boolean && code <= MonoTypeCode::R8; }
 
     bool m_initialized = false;
+
+    // Per-mod install diagnostics for LogHookSummary / Audit.GetRefusedHooks
+    std::unordered_map<std::string, ModHookStats> m_modStats;
+    size_t m_summarizedRefusals = 0; // total refusal records at last LogHookSummary (gates delta prints)
+
+    void RecordHookRequest(const std::string& modName);
+    void RecordHookRefusal(const std::string& modName, const std::string& target, const std::string& reason); // dedups on (mod, target, reason)
 
     // Map from original method pointer to hook chain
     std::unordered_map<void*, HookChain> m_chains;

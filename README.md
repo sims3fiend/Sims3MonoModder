@@ -15,7 +15,7 @@ Contact me on [Tumblr](https://sims3fiend.tumblr.com/) | [Discord](https://disco
 - **Fast reflection cache.** Native detours over Mono's class/method/field lookup enable repeated lookups to be O(1) hits game-wide. Mods can access this directly through `S3MM.Cache`, typed field/property accessors, method invocation, and introspection without the boxing overhead of `System.Reflection`. By-name conveniences (`Cache.GetField(obj, "mAge")`, `Cache.CallStatic(klass, "DoThing", args)`) skip the handle bookkeeping entirely.
 - **Exception & crash capture.** Detours over Mono's exception raise/handler paths and `g_error` log managed exceptions, attributed to the throwing mod in the S3MM log. A vectored handler also catches native interpreter faults, dumps the managed frame chain, and can recover from a known recurring crash to keep the game alive. A crash attributed to a baked hook records a strike in `baked_quarantine.txt`; after 2 strikes that target stops baking and runs boxed instead of crash-looping, with per-crash forensics in `baked_crashes.log`.
 - **Assembly conflict detection.** When a mod replaces a core game assembly (`ScriptCore`, `SimIFace`, `mscorlib`, etc.), S3MM records the source and version, flags same-version/duplicate replacements, and reports which copy was kept vs. discarded, so two mods fighting over the same assembly is visible in the Mods panel instead of silent.
-- **Hook audit API.** Mods can introspect the live hook graph at runtime through `S3MM.Audit`: `IsMethodHooked()`, `GetHookChain()` (per-method chain with mod names, priorities, and `IsEntry` marking the dispatch-stub holder), `IsMethodBaked()` / `GetBakeRejectReason()` for the typed fast path, `GetReplacedAssemblies()`, and `GetLoadedMods()`.
+- **Hook audit API.** Mods can introspect the live hook graph at runtime through `S3MM.Audit`: `IsMethodHooked()`, `GetHookChain()` (per-method chain with mod names, priorities, and `IsEntry` marking the dispatch-stub holder), `IsMethodBaked()` / `GetBakeRejectReason()` for the typed fast path, `GetReplacedAssemblies()`, `GetLoadedMods()`, and `GetRefusedHooks(modName)` for per-mod install refusals (reason included). Startup also logs a per-mod **hook install summary** ("N requested, M installed, K REFUSED")
 
 ### In-game overlay
 - **Mods Panel** loaded mods list, per-mod logs, hot-reload buttons, settings, init status.
@@ -40,6 +40,12 @@ Contact me on [Tumblr](https://sims3fiend.tumblr.com/) | [Discord](https://disco
 3. Launch the game. On first run S3MM should automatically extract `S3MM.Helper.dll` and dump the game's managed assemblies from their respective .package files into `Documents\Electronic Arts\The Sims 3\S3MM\`. These dumped vanilla assemblies double as the compile-time references for `.cs` mods and as the baseline the Assembly Diff compares against.
 
 4. Place mods in `Documents\Electronic Arts\The Sims 3\S3MM\`: compiled `.dll`s go in `S3MM\Mods\`, bare `.cs` sources go in `S3MM\Source\<ModName>\`. They get picked up on starting the game and via the Mods panel's **Scan for New Mods** button.
+
+## Logging flags
+
+Set in `S3MM.toml` (both default `false`):
+- **`Verbose = true`** - DEBUG-level logging
+- **`LogHookInvocations = true`** - traces every hook dispatch (chain entry, `CallNext` steps, return boxing). Independent of `Verbose`. Spams a lot of lines.
 
 ## Example Mod
 

@@ -212,6 +212,7 @@ bool HookManager::Initialize() {
     MonoBridge::Get().AddInternalCall("S3MM.Audit::GetReplacedAssemblies", (void*)&AuditAPI::NativeGetReplacedAssemblies);
     MonoBridge::Get().AddInternalCall("S3MM.Audit::GetLoadedModCount", (void*)&AuditAPI::NativeGetLoadedModCount);
     MonoBridge::Get().AddInternalCall("S3MM.Audit::GetLoadedMods", (void*)&AuditAPI::NativeGetLoadedMods);
+    MonoBridge::Get().AddInternalCall("S3MM.Audit::GetRefusedHooks", (void*)&AuditAPI::NativeGetRefusedHooks);
 
     m_initialized = true;
     LOG_INFO("[HookManager] Initialized");
@@ -231,8 +232,10 @@ uint32_t HookManager::AllocateDispatchToken(uint32_t preferredToken, void* targe
 
 // HOOK REGISTRATION - Register a hook or watcher by class/method name
 bool HookManager::RegisterHook(const std::string& targetClass, const std::string& targetMethod, void* hookMethod, HookType type, const std::string& modName, int priority, const std::string& signature) {
+    RecordHookRequest(modName);
     if (!hookMethod) {
         LOG_ERROR("[HookManager] RegisterHook: null hook method");
+        RecordHookRefusal(modName, targetClass + ":" + targetMethod, "null hook method pointer passed to Register");
         return false;
     }
 
@@ -247,6 +250,7 @@ bool HookManager::RegisterHook(const std::string& targetClass, const std::string
     void* originalMethod = FindTargetMethod(targetClass, targetMethod, signature, resolveImage);
     if (!originalMethod) {
         LOG_ERROR("[HookManager] Target method not found: " + targetClass + ":" + targetMethod + sigInfo);
+        RecordHookRefusal(modName, targetClass + ":" + targetMethod, "target method not found (typo, renamed game method, or an unloaded assembly)");
         return false;
     }
 
@@ -254,6 +258,7 @@ bool HookManager::RegisterHook(const std::string& targetClass, const std::string
     // Inflated targets are supported (full-size trampoline copy); only open generic definitions and corrupt shapes refuse
     if (std::string hazard = DescribeTrampolineHazard(originalMethod); !hazard.empty()) {
         LOG_ERROR("[HookManager] RegisterHook: refusing target " + targetClass + ":" + targetMethod + sigInfo + " from mod '" + modName + "' - " + hazard + ". See the generic-target notes in the modding docs.");
+        RecordHookRefusal(modName, targetClass + ":" + targetMethod, "unhookable target: " + hazard);
         return false;
     }
 
@@ -348,8 +353,10 @@ static std::string DeriveFullClassName(void* klass) {
 
 // HOOK REGISTRATION BY POINTER - Register using raw MonoMethod* directly
 bool HookManager::RegisterHookByPointer(void* targetMethod, void* hookMethod, HookType type, const std::string& modName, int priority) {
+    RecordHookRequest(modName);
     if (!targetMethod || !hookMethod) {
         LOG_ERROR("[HookManager] RegisterHookByPointer: null target or hook method");
+        RecordHookRefusal(modName, "??:??", "null target or hook method pointer passed to Register");
         return false;
     }
 
@@ -357,6 +364,9 @@ bool HookManager::RegisterHookByPointer(void* targetMethod, void* hookMethod, Ho
     // Inflated targets are supported via the full-size trampoline copy; only open generic definitions and corrupt shapes refuse
     if (std::string hazard = DescribeTrampolineHazard(targetMethod); !hazard.empty()) {
         LOG_ERROR("[HookManager] RegisterHookByPointer: refusing target @ " + ToHex((uintptr_t)targetMethod) + " from mod '" + modName + "' - " + hazard + ". See the generic-target notes in the modding docs.");
+        auto* hazardLayout = reinterpret_cast<MonoMethodLayout*>(targetMethod);
+        const char* hazardName = (hazardLayout->name && IsReadablePointer((void*)hazardLayout->name, 2)) ? hazardLayout->name : "???";
+        RecordHookRefusal(modName, DeriveFullClassName(hazardLayout->klass) + ":" + hazardName, "unhookable target: " + hazard);
         return false;
     }
 
@@ -475,6 +485,8 @@ void __cdecl HookManager::NativeRegisterHookByPointer(void* targetMethod, void* 
 void __cdecl HookManager::NativeApplyPendingHooks() {
     HookManager::Get().ReinstallDispatchStubs();
     HookManager::Get().ApplyHooks();
+    // Runtime-registered hooks: surface new refusals without re-printing the full startup summary
+    HookManager::Get().LogHookSummary(/*onlyIfNewRefusals=*/true);
 }
 
 // Is the target behind this token an instance method? Used by the un-baked Chain.CallNext boxing fallback to split a leading-self arg from the params (managed can't read the target's hasThis); 0 for an unknown token
@@ -491,6 +503,9 @@ int HookManager::RemoveHooksForMod(const std::string& modName) {
     int removed = 0;
 
     int staleMapEntries = 0;
+
+    // Reset install diagnostics so a hot-reloaded mod recounts from zero instead of double-counting its re-registrations
+    m_modStats.erase(modName);
 
     for (auto& [method, chain] : m_chains) {
         size_t hooksBefore = chain.hooks.size();
@@ -562,6 +577,55 @@ int HookManager::ApplyHooks() {
 
     LOG_INFO("[HookManager] Applied " + std::to_string(applied) + " hook chains");
     return applied;
+}
+
+// PER-MOD INSTALL DIAGNOSTICS - one request per RegisterHook/RegisterHookByPointer call
+void HookManager::RecordHookRequest(const std::string& modName) {
+    m_modStats[modName].requested++;
+}
+
+// Deduped on (mod, target, reason) - install retries would otherwise re-record the same refusal
+void HookManager::RecordHookRefusal(const std::string& modName, const std::string& target, const std::string& reason) {
+    auto& refusals = m_modStats[modName].refusals;
+    for (const auto& r : refusals) {
+        if (r.target == target && r.reason == reason) return;
+    }
+    refusals.push_back({target, reason});
+}
+
+// HOOK INSTALL SUMMARY - per-mod "N requested, M installed, K REFUSED (reason)" block; the loud counterpart to the scattered per-refusal ERROR lines
+void HookManager::LogHookSummary(bool onlyIfNewRefusals) {
+    size_t totalRefusals = 0;
+    for (const auto& [mod, stats] : m_modStats) { totalRefusals += stats.refusals.size(); }
+    if (onlyIfNewRefusals && totalRefusals == m_summarizedRefusals) return;
+
+    // Installed = entries on a patched chain (watchers ride in chain.hooks); entries stranded on another mod's refused chain count as not-installed
+    std::unordered_map<std::string, int> installed;
+    for (const auto& [method, chain] : m_chains) {
+        if (!chain.isPatched) continue;
+        for (const auto& e : chain.hooks) { installed[e.modName]++; }
+    }
+
+    LOG_INFO("[HookManager] ===== Hook install summary =====");
+    for (const auto& [mod, stats] : m_modStats) {
+        if (stats.requested == 0) continue;
+        if (onlyIfNewRefusals && stats.refusals.empty()) continue; // delta mode: only mods with refusals
+
+        int inst = 0;
+        auto it = installed.find(mod);
+        if (it != installed.end()) inst = it->second;
+
+        std::string line = "[HookManager]   " + mod + ": " + std::to_string(stats.requested) + " hooks requested, " + std::to_string(inst) + " installed";
+        if (stats.refusals.empty()) {
+            LOG_INFO(line);
+        } else {
+            LOG_WARN(line + ", " + std::to_string(stats.refusals.size()) + " REFUSED");
+            for (const auto& r : stats.refusals) { LOG_WARN("[HookManager]     REFUSED " + r.target + " - " + r.reason); }
+        }
+    }
+    LOG_INFO("[HookManager] =================================");
+
+    m_summarizedRefusals = totalRefusals;
 }
 
 // REINSTALL DISPATCH STUBS - Update stubs after hot-reload or chain changes
@@ -1308,6 +1372,7 @@ bool HookManager::InstallDispatchStub(HookChain& chain) {
             LOG_ERROR("[HookManager] REFUSING to install hook chain on " + chain.targetClass + "::" + chain.targetMethod + " - entry hook from mod '" + chain.hooks[0].modName + "' is ABI-incompatible: " + abi +
                       ". The entry hook is compiled under the target's signature, so its declared parameter/return types are the call ABI. " +
                       "The target stays UNHOOKED until the hook's declaration matches (loosely-typed handlers are only legal at lower priority behind a shape-matched entry hook).");
+            RecordHookRefusal(chain.hooks[0].modName, chain.targetClass + ":" + chain.targetMethod, "entry hook ABI-incompatible: " + abi);
             return false;
         }
     }
@@ -1758,6 +1823,7 @@ void HookManager::DemoteIneligibleTypedHooks(HookChain& chain) {
         if (!defect.empty()) {
             LOG_ERROR(
                 "[HookManager] Chain hook REJECTED (" + reason + "): " + chain.targetClass + "::" + chain.targetMethod + " <- mod '" + e.modName + "'. Fix the handler, or use the boxing Hook.CallNext / Hook.Ref API.");
+            RecordHookRefusal(e.modName, chain.targetClass + ":" + chain.targetMethod, "rejected typed hook: " + reason);
             rejected.push_back(e.hookMethod);
         } else {
             LOG_WARN("[HookManager] Chain hook not baked, running BOXED (" + reason + "): " + chain.targetClass + "::" + chain.targetMethod + " <- mod '" + e.modName + "'.");
@@ -1954,7 +2020,7 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
     bool needsCompile = (trampoline->runtimeMethod == nullptr);
 
     LOG_HOOK_TRACE("[HookManager] InvokeOriginal: using trampoline=" + std::to_string((uintptr_t)trampoline) + ", token=" + std::to_string(trampoline->token) +
-              ", runtime=" + std::to_string((uintptr_t)trampoline->runtimeMethod) + (needsCompile ? " (first-time compile)" : ""));
+                   ", runtime=" + std::to_string((uintptr_t)trampoline->runtimeMethod) + (needsCompile ? " (first-time compile)" : ""));
 
     // Ensure TLS is set up for Mono operations
     MonoBridge::Get().SetupTLS();
@@ -2226,8 +2292,8 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
         // Re-fetch state after push to get current values
         state = FindChainState(methodToken);
 
-        LOG_HOOK_TRACE("[HookManager] NativeCallNext: started chain for " + chain->targetClass + "::" + chain->targetMethod + " (" + std::to_string(chain->hooks.size()) + " hooks, " + std::to_string(chain->watchers.size()) +
-                  " watchers)");
+        LOG_HOOK_TRACE("[HookManager] NativeCallNext: started chain for " + chain->targetClass + "::" + chain->targetMethod + " (" + std::to_string(chain->hooks.size()) + " hooks, " +
+                       std::to_string(chain->watchers.size()) + " watchers)");
     } else {
         // Existing chain, nested CallNext call
         state->callDepth++; // Track nesting

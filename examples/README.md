@@ -79,6 +79,8 @@ A hook's declared C# return type **is** the return ABI; there is no marshalling 
 
 S3MM refuses to install a shape-mismatched **entry** hook (the highest-priority hook on a target) with an ERROR naming the exact type to declare, so the mismatch fails loud at install instead of corrupting at runtime. Loosely-typed catch-all handlers are still fine at lower priority behind a shape-matched entry hook.
 
+Refusals are also rolled up per mod in the startup **hook install summary** (`MyMod: 5 hooks requested, 4 installed, 1 REFUSED (declared 'object', target returns 'bool')`, look in the log for `Hook install summary`), and via `S3MM.Audit.GetRefusedHooks("MyMod")`, which returns a `"Class:Method - reason"` string per refused hook so a mod can self-check and complain in its own log instead of silently reverting.
+
 Value-type returns of **any width** work when declared exactly, the runtime pre-boxes the return so even a 16-byte `ResourceKey` round-trips intact e.g.:
 
 ```csharp
@@ -108,6 +110,8 @@ S3MM.HookInfo[] chain = S3MM.Audit.GetHookChain("Some.Class:Method");
 ```
 
 If you short-circuit deliberately, either pick a priority that makes the shadowing intentional, or gate it so normal chains pass through. I may add additional logging/stuff for this in the future.
+
+For dispatch-level debugging, set `LogHookInvocations = true` in `S3MM/S3MM.toml`: every chain entry, `CallNext` step (with the invoking mod), and return-boxing decision gets logged.
 
 ### Hooking methods on generic / nested-in-generic types
 

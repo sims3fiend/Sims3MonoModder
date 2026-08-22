@@ -350,4 +350,40 @@ void* __cdecl AuditAPI::NativeGetLoadedMods() {
     return array;
 }
 
+// A mod's refused hook installs, from HookManager's per-mod refusal records. empty/null modName -> all mods
+void* __cdecl AuditAPI::NativeGetRefusedHooks(void* modNameStr) {
+    auto& bridge = MonoBridge::Get();
+    std::string modName = modNameStr ? bridge.ExtractString(modNameStr) : "";
+
+    std::vector<std::string> lines;
+    for (const auto& [mod, stats] : HookManager::Get().GetModHookStats()) {
+        if (!modName.empty() && mod != modName) continue;
+        for (const auto& r : stats.refusals) { lines.push_back((modName.empty() ? mod + ": " : "") + r.target + " - " + r.reason); }
+    }
+    if (lines.empty()) return nullptr;
+
+    // string[] via mono_defaults.string_class (same pattern as NativeGetLoadedMods)
+    uintptr_t stringClassAddr = Addresses::Defaults.string_class;
+    if (!stringClassAddr) {
+        LOG_ERROR("[AuditAPI] mono_defaults.string_class address not resolved");
+        return nullptr;
+    }
+    void* stringKlass = *(void**)stringClassAddr;
+    if (!stringKlass) {
+        LOG_ERROR("[AuditAPI] mono_defaults.string_class is null");
+        return nullptr;
+    }
+
+    void* array = bridge.CreateArray(stringKlass, static_cast<int32_t>(lines.size()));
+    if (!array) return nullptr;
+
+    for (int32_t i = 0; i < static_cast<int32_t>(lines.size()); i++) {
+        void* elemPtr = bridge.GetArrayElementPtr(array, i, sizeof(void*));
+        if (!elemPtr) continue;
+        *(void**)elemPtr = bridge.CreateString(lines[i].c_str());
+    }
+
+    return array;
+}
+
 } // namespace S3MM
