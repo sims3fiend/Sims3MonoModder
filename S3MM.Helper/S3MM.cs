@@ -9,7 +9,7 @@ namespace S3MM
     /// </summary>
     public static class Version
     {
-        public const int Api = 2;
+        public const int Api = 3;
     }
 
     /// <summary>Native bridge for S3MM hook system. These methods call into the native S3MM code.
@@ -31,6 +31,25 @@ namespace S3MM
         /// <summary>True if the target behind <paramref name="methodToken"/> is an instance method. Lets the un-baked Chain.CallNext fallback split a leading-self arg from the params.</summary>
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern bool TargetIsInstance(uint methodToken);
+
+        // Caller introspection - each walks interpreter frames to the game frame below the innermost hooked method. See Hook.Caller*.
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern IntPtr CallerMethod();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern string CallerName();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern bool CallerIs(string fullName);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern object CallerInstance();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern object[] CallerArgs();
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        internal static extern uint CallerMintOffset();
     }
 
     /// <summary>
@@ -982,6 +1001,54 @@ namespace S3MM
             where T : struct
         {
             return new T[] { value };
+        }
+
+        // CALLER INTROSPECTION - who called the hooked method. Each member re-walks the interpreter frames (cheap, no capture), so read what you need and nothing more, please.
+        // Properties are allocation-free (CallerName allocates its string), GetCallerArgs boxes a copy of every parameter and is meant for diagnostics, not hot paths/hooks.
+        // The caller of the INNERMOST hooked method below you. A hooked method called from another hook's handler reports that handler, a recursive target reports the outer activation.
+        // Native/engine callers (simulator tasks, event dispatch, BeginInvoke targets) have no managed frame and report IntPtr.Zero / null / false.
+        // Values are a live view of the caller's frame, not a snapshot at call time.
+
+        /// <summary>Canonical MonoMethod* of the calling method, or IntPtr.Zero for a native caller or outside a hook context. Stable for the process, usable with <see cref="RegisterByPointer"/>.</summary>
+        public static IntPtr CallerMethod
+        {
+            get { return Native.CallerMethod(); }
+        }
+
+        /// <summary>"Namespace.Class::Method" of the caller, or null.</summary>
+        public static string CallerName
+        {
+            get { return Native.CallerName(); }
+        }
+
+        /// <summary>True if the caller is <paramref name="method"/> (from <see cref="Cache.FindMethod"/> or a previous <see cref="CallerMethod"/>). Pointer compare, no allocation - the cheapest gate.</summary>
+        public static bool CalledFrom(IntPtr method)
+        {
+            return method != IntPtr.Zero && Native.CallerMethod() == method;
+        }
+
+        /// <summary>True if the caller's full name is <paramref name="fullName"/> ("Namespace.Class::Method"). Compared natively, no managed allocation.</summary>
+        public static bool CalledFrom(string fullName)
+        {
+            return Native.CallerIs(fullName);
+        }
+
+        /// <summary>The caller's <c>this</c>, or null for a static method or native caller. Struct receivers come back as a boxed copy.</summary>
+        public static object CallerInstance
+        {
+            get { return Native.CallerInstance(); }
+        }
+
+        /// <summary>The caller's current parameter values, boxed, in signature order (ref/out params dereferenced). Null when there is no managed caller or the frame can't be read.</summary>
+        public static object[] GetCallerArgs()
+        {
+            return Native.CallerArgs();
+        }
+
+        /// <summary>MINT bytecode offset of the call site inside the caller. Distinguishes two call sites in one method; it is not an IL offset and changes if the method is re-transformed.</summary>
+        public static uint CallerMintOffset
+        {
+            get { return Native.CallerMintOffset(); }
         }
 
         // TODO: Resort

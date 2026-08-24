@@ -1,4 +1,5 @@
 #include "chain_compiler.h"
+#include "method_patcher.h"
 #include "../core/addresses.h"
 #include "../core/il_parser.h"
 #include "../core/mono_bridge.h"
@@ -127,7 +128,7 @@ bool SignatureInfo::ExactMatch(const SignatureInfo& target) const {
     // CompileChain re-signs each link clone under the target's instance signature so `ldarg.0` lowers to LDARG_this; value-type receivers are refused there (a struct's `this` is a managed pointer `object self` can't carry)
     if (target.hasThis && !hasThis) {
         if (paramCount != (uint16_t)(target.paramCount + 1)) return false;
-        if (paramCount == 0) return false; // defensive: need the leading self slot
+        if (paramCount == 0) return false;                        // defensive: need the leading self slot
         if (paramIsByRef[0] || paramIsValueType[0]) return false; // receiver = plain ref slot
         for (uint16_t i = 0; i < target.paramCount; ++i) {
             if (paramTypes[i + 1] != target.paramTypes[i]) return false;
@@ -212,7 +213,7 @@ void* ChainCompiler::CloneMethod(void* method) {
     return copy;
 }
 
-// BY-REF SMUGGLE NOP - rewrite `call S3MM.Chain::ByRef<T>` sites to a 5-byte nop run, TRANSIENTLY 
+// BY-REF SMUGGLE NOP - rewrite `call S3MM.Chain::ByRef<T>` sites to a 5-byte nop run, TRANSIENTLY
 // For a `ref/out T` arg the compiler emits `<ldarg/ldloca>; call ByRef<T>`; the load pushes T&, and ByRef (body `return default(T)`) would pop it and push garbage
 // Nopping the call leaves T& on the eval stack to flow straight into the rewritten `call CallNext<...>` (retargeted to <next>), which expects T& there
 // Net stack effect is unchanged (pop-1/push-1 == 5x nop == 0) and T&/T are both pointer-width on the MINT stack, so arg_offsets/args_size are unaffected - same-size patch
@@ -569,13 +570,10 @@ bool ChainCompiler::CompileChain(CompiledChain& c) {
         }
 
         L.callNextSlots = std::move(cap.slots);
-        LOG_DEBUG("[ChainCompiler] link " + std::to_string(i) + " transformed (" + (L.kind == LinkKind::ShimHook ? "shim" : "typed") + "); captured " +
-                  std::to_string(L.callNextSlots.size()) + " CallNext slot(s)");
+        LOG_DEBUG("[ChainCompiler] link " + std::to_string(i) + " transformed (" + (L.kind == LinkKind::ShimHook ? "shim" : "typed") + "); captured " + std::to_string(L.callNextSlots.size()) + " CallNext slot(s)");
         // A ShimHook legitimately captures zero, since it forwards via the boxing ICALL rather than a baked slot
         // For a TypedHook, empty means either a pure replacement (legal) or - if the instrument is down - that every baked slot was silently missed, and only the latter is worth warning about
-        if (L.kind == LinkKind::TypedHook && L.callNextSlots.empty() && !m_installed) {
-            LOG_WARN("[ChainCompiler] CompileChain: instrument not installed; CallNext slots not captured for link " + std::to_string(i));
-        }
+        if (L.kind == LinkKind::TypedHook && L.callNextSlots.empty() && !m_installed) { LOG_WARN("[ChainCompiler] CompileChain: instrument not installed; CallNext slots not captured for link " + std::to_string(i)); }
     }
 
     // 2. Wire the baked forwards: a TypedHook link's captured CallNext data_items -> link[i+1].linkRTM (which may be a typed clone OR a shim clone, since the baked call op enters either identically), and the last typed link -> trampolineRTM
@@ -600,8 +598,16 @@ bool ChainCompiler::InstallChain(CompiledChain& c) {
     auto* target = reinterpret_cast<MonoMethodLayout*>(c.targetMethod);
     DWORD oldProtect = 0;
 
-    if (!c.headRTM) {
-        // FIRST INSTALL - transplant the head RTM onto the target's runtimeMethod slot
+    if (!c.headRTM && target->runtimeMethod) {
+        // FIRST INSTALL, target already transformed - overwrite its own RTM in place: direct calls (0xEB) and ldftn bound that pointer at their transform, a swapped +0x14 would munt/strand them
+        // Keep the pre-overwrite bytes so teardown can put the original back under the same pointer
+        auto* liveRTM = reinterpret_cast<RuntimeMethod*>(target->runtimeMethod);
+        c.savedOriginalRTM = *liveRTM;
+        c.overwroteOriginal = true;
+        MethodPatcher::OverwriteRTM(liveRTM, reinterpret_cast<RuntimeMethod*>(newHead), c.targetMethod);
+        c.headRTM = liveRTM;
+    } else if (!c.headRTM) {
+        // FIRST INSTALL, never transformed, nothing can have bound an RTM yet (r-right?), so transplant the head onto the runtimeMethod slot
         if (!VirtualProtect(c.targetMethod, sizeof(MonoMethodLayout), PAGE_EXECUTE_READWRITE, &oldProtect)) {
             LOG_ERROR("[ChainCompiler] InstallChain: VirtualProtect failed");
             return false;
@@ -615,15 +621,7 @@ bool ChainCompiler::InstallChain(CompiledChain& c) {
         // Entry fields are copied non-atomically, which is benign while the head method is unchanged since it re-transforms to identical bytes
         // KNOWN GAP - if link[0]'s USER METHOD changed across the recompile the staged bytes differ, and a game thread entering during the memcpy can latch a torn RTM (deferred with the hot-reload review; the header-stub design would reduce this to one atomic PatchDataItem)
         // Old link RTMs and their clone MonoMethodLayouts leak per recompile - deliberate, since an in-flight frame may still be executing an old link, and `version` counts recompiles for leak accounting
-        auto* head = reinterpret_cast<RuntimeMethod*>(c.headRTM);
-        void* newDataItems = reinterpret_cast<RuntimeMethod*>(newHead)->data_items;
-
-        RuntimeMethod staged = *reinterpret_cast<RuntimeMethod*>(newHead);
-        staged.method = c.targetMethod;       // back-pointer -> original (frame-walk / audit)
-        staged.data_items = head->data_items; // keep the live array during the bulk copy
-        memcpy(head, &staged, sizeof(RuntimeMethod));
-
-        InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&head->data_items), newDataItems);
+        MethodPatcher::OverwriteRTM(reinterpret_cast<RuntimeMethod*>(c.headRTM), reinterpret_cast<RuntimeMethod*>(newHead), c.targetMethod);
     }
 
     c.version++;

@@ -34,7 +34,15 @@ static MonoMethodInflatedLayout* MakeCompileProxy(const MonoMethodLayout* replac
     return p;
 }
 
-bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMethod, bool* deferredRestore, void** ioInstalledRTM) {
+void MethodPatcher::OverwriteRTM(RuntimeMethod* dst, const RuntimeMethod* src, void* methodBackPointer) {
+    RuntimeMethod staged = *src;
+    staged.method = methodBackPointer;
+    staged.data_items = dst->data_items; // keep the live array during the bulk copy
+    memcpy(dst, &staged, sizeof(RuntimeMethod));
+    InterlockedExchangePointer(reinterpret_cast<void* volatile*>(&dst->data_items), src->data_items);
+}
+
+bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMethod, bool* deferredRestore, void** ioInstalledRTM, RuntimeMethod* outSavedOriginalRTM) {
     if (!originalMethod || !replacementMethod) {
         LOG_ERROR("[MethodPatcher] ForcePatchMethod: null method pointer");
         return false;
@@ -56,8 +64,9 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
     // FRESH-RTM TRANSPLANT - two install strategies depending on prior compilation
     // Stock mono caches RTMs in MonoDomain->jit_code_hash; the EA build removed that, create_runtime_method (0xe51f20) uses MonoMethod+0x14
     // An already-transformed method can't be re-transformed (transform early-outs on RTM flags & 0x100), so the hook RTM is built off-heap
-    // Pre-patch callers interned the old RTM pointer in their MINT data_items, so the old RTM must stay valid (hot-reload edits it in place)
-    // Already-compiled original: transform a heap proxy, transplant the fresh RTM onto original->runtimeMethod
+    // Direct calls (0xEB) and ldftn intern the callee RTM pointer in the caller's data_items at transform time, so an already-compiled original is overwritten IN PLACE (first install and reload alike):
+    // pointer-swapping +0x14 would strand every caller transformed before the install, and every delegate created before it
+    // Already-compiled original: transform a heap proxy, copy its RTM over the original's own RTM (pre-overwrite bytes go to outSavedOriginalRTM for unhook)
     // Never-compiled original: clobber token/klass so lazy first-call compilation reads the hook's IL
     // Caller is told which path ran via deferredRestore.
 
@@ -110,8 +119,7 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
         // Fix the back-pointer on the COPY only (the real method's own RTM keeps pointing at itself for frame walking).
         // Sub-arrays (code, data_items, arg/local offsets, clauses) are domain-mempool allocated, so the copied pointers stay valid.
         // original->runtimeMethod already == *ioInstalledRTM, unchanged.
-        memcpy(*ioInstalledRTM, srcRtm, sizeof(RuntimeMethod));
-        reinterpret_cast<RuntimeMethod*>(*ioInstalledRTM)->method = originalMethod;
+        OverwriteRTM(reinterpret_cast<RuntimeMethod*>(*ioInstalledRTM), reinterpret_cast<RuntimeMethod*>(srcRtm), originalMethod);
         if (deferredRestore) *deferredRestore = false;
         LOG_INFO("[MethodPatcher] Force patched (in-place RTM): " + origName + " -> " + replName);
         return true;
@@ -138,20 +146,13 @@ bool MethodPatcher::ForcePatchMethod(void* originalMethod, void* replacementMeth
         if (compileProxy->runtimeMethod) {
             LOG_DEBUG("[MethodPatcher] Fresh RTM from proxy: " + ToHex((uintptr_t)compileProxy->runtimeMethod));
 
-            // Fix RTM back-pointer: RTM->method (offset 0x08) points to proxy, redirect to original for frame walking
-            *(void**)((uintptr_t)compileProxy->runtimeMethod + 0x08) = originalMethod;
+            // FIRST INSTALL - overwrite the original's own RTM in place; +0x14 never changes, so pre-bound call sites and ldftn captures dispatch through the hook too
+            // The trampoline is a separate clone with its own RTM (BackupOriginalMethod), so nothing else depends on these bytes, the pre-overwrite copy is the unhook restore
+            auto* liveRTM = reinterpret_cast<RuntimeMethod*>(original->runtimeMethod);
+            if (outSavedOriginalRTM) *outSavedOriginalRTM = *liveRTM;
+            OverwriteRTM(liveRTM, reinterpret_cast<RuntimeMethod*>(compileProxy->runtimeMethod), originalMethod);
 
-            // FIRST INSTALL - transplant the fresh RTM onto the original.
-            // Remember it so future reloads overwrite its contents in place (handled by the in-place branch above).
-            if (!VirtualProtect(originalMethod, sizeof(MonoMethodLayout), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                LOG_ERROR("[MethodPatcher] ForcePatchMethod: VirtualProtect failed");
-                delete proxyAlloc;
-                return false;
-            }
-            original->runtimeMethod = compileProxy->runtimeMethod;
-            VirtualProtect(originalMethod, sizeof(MonoMethodLayout), oldProtect, &oldProtect);
-
-            if (ioInstalledRTM) *ioInstalledRTM = compileProxy->runtimeMethod;
+            if (ioInstalledRTM) *ioInstalledRTM = liveRTM;
 
             // compileProxy intentionally leaked - RTM->method may reference it.
             if (deferredRestore) *deferredRestore = false;

@@ -168,19 +168,20 @@ static const CallSite s_addInternalCallSites[] = {
 // To add more: find the next A3 store in mono_init_internal, read its operand offset.
 // Init order differs from struct layout (e.g., UIntPtr before IntPtr).
 static const CallSite s_monoInitInternalSites[] = {
-    SITE_ABS(Defaults.boolean_class, "Defaults.boolean_class", 0x1E7), // e75dd7
-    SITE_ABS(Defaults.byte_class, "Defaults.byte_class", 0x225),       // e75e15
-    SITE_ABS(Defaults.sbyte_class, "Defaults.sbyte_class", 0x262),     // e75e52
-    SITE_ABS(Defaults.int16_class, "Defaults.int16_class", 0x2A0),     // e75e90
-    SITE_ABS(Defaults.uint16_class, "Defaults.uint16_class", 0x2DE),   // e75ece
-    SITE_ABS(Defaults.int32_class, "Defaults.int32_class", 0x31B),     // e75f0b
-    SITE_ABS(Defaults.uint32_class, "Defaults.uint32_class", 0x359),   // e75f49
-    SITE_ABS(Defaults.int64_class, "Defaults.int64_class", 0x412),     // e76002
-    SITE_ABS(Defaults.uint64_class, "Defaults.uint64_class", 0x450),   // e76040
-    SITE_ABS(Defaults.single_class, "Defaults.single_class", 0x48D),   // e7607d
-    SITE_ABS(Defaults.double_class, "Defaults.double_class", 0x4CB),   // e760bb
-    SITE_ABS(Defaults.char_class, "Defaults.char_class", 0x509),       // e760f9
-    SITE_ABS(Defaults.string_class, "Defaults.string_class", 0x546),   // e76136
+    SITE_ABS(Defaults.boolean_class, "Defaults.boolean_class", 0x1E7),                     // e75dd7
+    SITE_ABS(Defaults.byte_class, "Defaults.byte_class", 0x225),                           // e75e15
+    SITE_ABS(Defaults.sbyte_class, "Defaults.sbyte_class", 0x262),                         // e75e52
+    SITE_ABS(Defaults.int16_class, "Defaults.int16_class", 0x2A0),                         // e75e90
+    SITE_ABS(Defaults.uint16_class, "Defaults.uint16_class", 0x2DE),                       // e75ece
+    SITE_ABS(Defaults.int32_class, "Defaults.int32_class", 0x31B),                         // e75f0b
+    SITE_ABS(Defaults.uint32_class, "Defaults.uint32_class", 0x359),                       // e75f49
+    SITE_ABS(Defaults.int64_class, "Defaults.int64_class", 0x412),                         // e76002
+    SITE_ABS(Defaults.uint64_class, "Defaults.uint64_class", 0x450),                       // e76040
+    SITE_ABS(Defaults.single_class, "Defaults.single_class", 0x48D),                       // e7607d
+    SITE_ABS(Defaults.double_class, "Defaults.double_class", 0x4CB),                       // e760bb
+    SITE_ABS(Defaults.char_class, "Defaults.char_class", 0x509),                           // e760f9
+    SITE_ABS(Defaults.string_class, "Defaults.string_class", 0x546),                       // e76136
+    SITE_ABS(Defaults.multicastdelegate_class, "Defaults.multicastdelegate_class", 0x63D), // e7622d
 };
 
 // EXTRACTOR TABLE
@@ -292,19 +293,20 @@ static AddressEntry s_entries[] = {
 
     // MonoDefaults - primitive types only (12 of 62)
     // Extracted from mono_init_internal; fallback = global address of mono_defaults field
-    ADDR(Defaults.boolean_class, nullptr, 0, 0x01220E50, false), // +0x10
-    ADDR(Defaults.sbyte_class, nullptr, 0, 0x01220E54, false),   // +0x14
-    ADDR(Defaults.byte_class, nullptr, 0, 0x01220E48, false),    // +0x08
-    ADDR(Defaults.int16_class, nullptr, 0, 0x01220E58, false),   // +0x18
-    ADDR(Defaults.uint16_class, nullptr, 0, 0x01220E5C, false),  // +0x1C
-    ADDR(Defaults.int32_class, nullptr, 0, 0x01220E60, false),   // +0x20
-    ADDR(Defaults.uint32_class, nullptr, 0, 0x01220E64, false),  // +0x24
-    ADDR(Defaults.int64_class, nullptr, 0, 0x01220E70, false),   // +0x30
-    ADDR(Defaults.uint64_class, nullptr, 0, 0x01220E74, false),  // +0x34
-    ADDR(Defaults.single_class, nullptr, 0, 0x01220E78, false),  // +0x38
-    ADDR(Defaults.double_class, nullptr, 0, 0x01220E7C, false),  // +0x3C
-    ADDR(Defaults.char_class, nullptr, 0, 0x01220E80, false),    // +0x40
-    ADDR(Defaults.string_class, nullptr, 0, 0x01220E84, false),  // +0x44
+    ADDR(Defaults.boolean_class, nullptr, 0, 0x01220E50, false),           // +0x10
+    ADDR(Defaults.sbyte_class, nullptr, 0, 0x01220E54, false),             // +0x14
+    ADDR(Defaults.byte_class, nullptr, 0, 0x01220E48, false),              // +0x08
+    ADDR(Defaults.int16_class, nullptr, 0, 0x01220E58, false),             // +0x18
+    ADDR(Defaults.uint16_class, nullptr, 0, 0x01220E5C, false),            // +0x1C
+    ADDR(Defaults.int32_class, nullptr, 0, 0x01220E60, false),             // +0x20
+    ADDR(Defaults.uint32_class, nullptr, 0, 0x01220E64, false),            // +0x24
+    ADDR(Defaults.int64_class, nullptr, 0, 0x01220E70, false),             // +0x30
+    ADDR(Defaults.uint64_class, nullptr, 0, 0x01220E74, false),            // +0x34
+    ADDR(Defaults.single_class, nullptr, 0, 0x01220E78, false),            // +0x38
+    ADDR(Defaults.double_class, nullptr, 0, 0x01220E7C, false),            // +0x3C
+    ADDR(Defaults.char_class, nullptr, 0, 0x01220E80, false),              // +0x40
+    ADDR(Defaults.string_class, nullptr, 0, 0x01220E84, false),            // +0x44
+    ADDR(Defaults.multicastdelegate_class, nullptr, 0, 0x01220E94, false), // +0x54
     // Remaining mono_defaults fields: trace A3 stores in mono_init_internal.
     // Each target operand is a mono_defaults global. Base ~0x01220E40, stride 4.
 

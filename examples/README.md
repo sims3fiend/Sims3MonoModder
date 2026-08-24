@@ -138,6 +138,16 @@ For event-ish (non-hot) code there are by-name conveniences that skip the handle
 - A missing member **throws** `ArgumentException`, so a typo'd name is loud at the call site. A `null` from `GetField` always means the field's value is null, never "field not found".
 - Method resolution is by name + **argument count** only. For overloads that differ only by parameter types, resolve the handle explicitly with `FindMethod` and use `Invoke`.
 
+### Who may I ask is calling? `Hook.CalledFrom` / `Hook.CallerInstance` / `Hook.GetCallerArgs`
+
+From inside a handler you can ask about the game method that called the hooked target. Each member walks the interpreter frames on demand (nothing is captured per call), so the cost scales with what you actually read/use:
+
+- `Hook.CalledFrom(IntPtr)` / `Hook.CalledFrom("Namespace.Class::Method")` and `Hook.CallerMethod` are allocation-free. Gate a hook on its call site with these; cache the `IntPtr` from `Cache.FindMethod` as the cheapest option.
+- `Hook.CallerInstance` is the caller's `this` (null for statics), `Hook.CallerName` allocates the name string.
+- `Hook.GetCallerArgs()` boxes a copy of every parameter of the caller. Don't use on something frequently used or.
+
+You get the caller of the *innermost* hooked method below you, so a target called from another hook's handler reports that handler. Native/icall/whatever/engine callers (simulator tasks, event dispatch, `BeginInvoke` targets) have no managed frame and report `IntPtr.Zero` / `null` / `false`. Values are a view of the caller's frame, not a snapshot.
+
 ### Use `[S3MM.OnLoad]`, not static constructors
 
 An exception in a static constructor becomes a permanent `TypeInitializationException`; the type is dead for the rest of the session. `[S3MM.OnLoad]` runs after your hooks are registered and applied, exceptions are caught and logged with your mod's name attribution, multiple OnLoad methods are supported, and it re-fires after hot-reload. Pair it with `[S3MM.OnUnload]` (runs before hooks are torn down) to restore any game state you changed; see the sleep-ticks save/restore pattern in ExampleMod.

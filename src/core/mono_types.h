@@ -51,6 +51,9 @@ constexpr uint32_t CLASS_NAME = 0x34;
 constexpr uint32_t CLASS_NAMESPACE = 0x38;
 constexpr uint32_t CLASS_NESTED_IN = 0x28;
 constexpr uint32_t CLASS_PARENT = 0x24;
+constexpr uint32_t CLASS_FLAGS_BYTE = 0x14;    // bitfield byte: inited|init_pending|size_inited|valuetype|enumtype|...
+constexpr uint8_t CLASS_FLAG_VALUETYPE = 0x08; // interp_mono_invoke_with_state reads enumtype as (klass+0x14 & 0x10) valuetype is the bit below
+constexpr uint8_t CLASS_FLAG_ENUMTYPE = 0x10;
 constexpr uint32_t CLASS_FIELD_COUNT = 0x68;
 constexpr uint32_t CLASS_FIELDS = 0x88;
 

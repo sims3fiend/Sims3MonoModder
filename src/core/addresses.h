@@ -117,19 +117,20 @@ struct MonoGlobals {
 // Validate against mono_init_internal (0x00E75BF0) assertion strings
 struct MonoDefaults {
     // Primitive type classes - used by GetTypeClassFromMonoType / GetMonoClassForTypeCode
-    uintptr_t boolean_class = 0; // +0x10 System.Boolean
-    uintptr_t sbyte_class = 0;   // +0x14 System.SByte
-    uintptr_t byte_class = 0;    // +0x08 System.Byte
-    uintptr_t int16_class = 0;   // +0x18 System.Int16
-    uintptr_t uint16_class = 0;  // +0x1C System.UInt16
-    uintptr_t int32_class = 0;   // +0x20 System.Int32
-    uintptr_t uint32_class = 0;  // +0x24 System.UInt32
-    uintptr_t int64_class = 0;   // +0x30 System.Int64
-    uintptr_t uint64_class = 0;  // +0x34 System.UInt64
-    uintptr_t single_class = 0;  // +0x38 System.Single
-    uintptr_t double_class = 0;  // +0x3C System.Double
-    uintptr_t char_class = 0;    // +0x40 System.Char
-    uintptr_t string_class = 0;  // +0x44 System.String
+    uintptr_t boolean_class = 0;           // +0x10 System.Boolean
+    uintptr_t sbyte_class = 0;             // +0x14 System.SByte
+    uintptr_t byte_class = 0;              // +0x08 System.Byte
+    uintptr_t int16_class = 0;             // +0x18 System.Int16
+    uintptr_t uint16_class = 0;            // +0x1C System.UInt16
+    uintptr_t int32_class = 0;             // +0x20 System.Int32
+    uintptr_t uint32_class = 0;            // +0x24 System.UInt32
+    uintptr_t int64_class = 0;             // +0x30 System.Int64
+    uintptr_t uint64_class = 0;            // +0x34 System.UInt64
+    uintptr_t single_class = 0;            // +0x38 System.Single
+    uintptr_t double_class = 0;            // +0x3C System.Double
+    uintptr_t char_class = 0;              // +0x40 System.Char
+    uintptr_t string_class = 0;            // +0x44 System.String
+    uintptr_t multicastdelegate_class = 0; // +0x54 System.MulticastDelegate - delegate-wrapper frame test (GetCaller) auhhg
 };
 
 // GAME - Script Host

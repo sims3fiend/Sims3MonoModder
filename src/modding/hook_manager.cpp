@@ -14,12 +14,29 @@
 #include <cstdarg>
 #include <cstring>
 #include <fstream>
+#include <unordered_set>
 #include <Windows.h>
 
 namespace S3MM {
 
 // THREAD-LOCAL CHAIN STATE - Stack of active chain executions, supports nested/recursive hooks
 thread_local std::vector<ChainExecutionState> t_chainStack;
+
+// INVOKE BRIDGES - a runtime-invoked method executes in a frame whose parent is NULL (the invoke's own base frame is separate and never chained)
+// The interpreter's parent links stop at every hook[1..N] / trampoline entry; every runtime-invoke in the dispatch path records the frame it was made from
+// ResolveCallerFrame steps across a NULL parent onto the innermost unconsumed entry (LIFO matches nesting since all entries sit on this thread's native stack)
+thread_local std::vector<InterpFrame*> t_invokeBridges;
+
+static InterpFrame* CurrentInterpFrame() {
+    if (!Addresses::Profiler.g_thread_context_tls_index) return nullptr;
+    auto* tc = reinterpret_cast<ThreadContext*>(TlsGetValue(*(DWORD*)Addresses::Profiler.g_thread_context_tls_index));
+    return tc ? tc->current_frame : nullptr;
+}
+
+struct InvokeBridge {
+    InvokeBridge() { t_invokeBridges.push_back(CurrentInterpFrame()); }
+    ~InvokeBridge() { t_invokeBridges.pop_back(); }
+};
 
 // Helper to find active chain state for a given token
 static ChainExecutionState* FindChainState(uint32_t methodToken) {
@@ -116,6 +133,14 @@ bool HookManager::Initialize() {
     MonoBridge::Get().AddInternalCall("S3MM.Native::CallOriginal", (void*)&HookManager::NativeCallOriginal);
     MonoBridge::Get().AddInternalCall("S3MM.Native::GetCallerHookToken", (void*)&HookManager::NativeGetCallerHookToken);
     MonoBridge::Get().AddInternalCall("S3MM.Native::TargetIsInstance", (void*)&HookManager::NativeTargetIsInstance);
+
+    // Caller introspection (S3MM.Hook.Caller*)
+    MonoBridge::Get().AddInternalCall("S3MM.Native::CallerMethod", (void*)&HookManager::NativeCallerMethod);
+    MonoBridge::Get().AddInternalCall("S3MM.Native::CallerName", (void*)&HookManager::NativeCallerName);
+    MonoBridge::Get().AddInternalCall("S3MM.Native::CallerIs", (void*)&HookManager::NativeCallerIs);
+    MonoBridge::Get().AddInternalCall("S3MM.Native::CallerInstance", (void*)&HookManager::NativeCallerInstance);
+    MonoBridge::Get().AddInternalCall("S3MM.Native::CallerArgs", (void*)&HookManager::NativeCallerArgs);
+    MonoBridge::Get().AddInternalCall("S3MM.Native::CallerMintOffset", (void*)&HookManager::NativeCallerMintOffset);
 
     // Auto-prefixed log API (S3MM.Log class)
     MonoBridge::Get().AddInternalCall("S3MM.Log::Info", (void*)&HookManager::NativeLogInfo);
@@ -645,7 +670,14 @@ int HookManager::ReinstallDispatchStubs() {
                 auto* layout = reinterpret_cast<MonoMethodLayout*>(chain.originalMethod);
                 DWORD oldProtect;
                 if (VirtualProtect(chain.originalMethod, sizeof(MonoMethodLayout), PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                    layout->runtimeMethod = chain.originalRuntimeMethod; // backup captured pre-patch (may be null)
+                    auto compIt = m_compiledChains.find(chain.originalMethod);
+                    if (compIt != m_compiledChains.end() && compIt->second.overwroteOriginal) {
+                        // Head lives in the target's own RTM (callers bound that pointer): put the original bytes back under it
+                        MethodPatcher::OverwriteRTM(reinterpret_cast<RuntimeMethod*>(compIt->second.headRTM), &compIt->second.savedOriginalRTM, chain.originalMethod);
+                        layout->runtimeMethod = compIt->second.headRTM;
+                    } else {
+                        layout->runtimeMethod = chain.originalRuntimeMethod; // backup captured pre-patch (may be null)
+                    }
                     VirtualProtect(chain.originalMethod, sizeof(MonoMethodLayout), oldProtect, &oldProtect);
                     chain.bakedActive = false;
                     chain.isPatched = false;
@@ -678,11 +710,18 @@ int HookManager::ReinstallDispatchStubs() {
                 // Full struct copy for safety in case of future changes.
                 auto* trampoline = reinterpret_cast<MonoMethodLayout*>(chain.trampolineMethod);
                 *layout = *trampoline;
-                layout->runtimeMethod = nullptr; // Force recompilation with original IL
+                if (chain.originalRTMOverwritten) {
+                    // The stub lives in the original's own RTM (callers bound that pointer): put the original bytes back under it
+                    MethodPatcher::OverwriteRTM(reinterpret_cast<RuntimeMethod*>(chain.installedRTM), &chain.savedOriginalRTM, chain.originalMethod);
+                    layout->runtimeMethod = chain.installedRTM;
+                    chain.originalRTMOverwritten = false;
+                } else {
+                    layout->runtimeMethod = nullptr; // Force recompilation with original IL
+                }
                 VirtualProtect(chain.originalMethod, sizeof(MonoMethodLayout), oldProtect, &oldProtect);
 
                 chain.isPatched = false;
-                chain.installedRTM = nullptr; // RTM no longer referenced by the original; a future re-hook does a fresh transplant
+                chain.installedRTM = nullptr; // a future re-hook installs afresh (in place again if the RTM still exists)
                 reinstalled++;
                 LOG_INFO("[HookManager] Restored original method: " + chain.targetClass + "::" + chain.targetMethod + " (chain emptied, no hooks remain)");
             } else {
@@ -698,8 +737,16 @@ int HookManager::ReinstallDispatchStubs() {
 
         // Use ForcePatchMethod to update even if already patched. Pass installedRTM so a reload oerwrites the existing dispatch RTM in place (callers cached its pointer) instead of swapping in a new RTM they'd never see
         bool deferred = false;
-        if (MethodPatcher::Get().ForcePatchMethod(chain.originalMethod, newEntryHook, &deferred, &chain.installedRTM)) {
+        RuntimeMethod saved = {};
+        void* preInstallRTM = reinterpret_cast<MonoMethodLayout*>(chain.originalMethod)->runtimeMethod;
+        if (MethodPatcher::Get().ForcePatchMethod(chain.originalMethod, newEntryHook, &deferred, &chain.installedRTM, &saved)) {
+            // A previously-restored chain re-hooking an existing RTM is a first install again: keep the pre-overwrite bytes (a clobber-compiled RTM on an already-patched chain is NOT original bytes)
+            if (!chain.isPatched && preInstallRTM && chain.installedRTM == preInstallRTM) {
+                chain.savedOriginalRTM = saved;
+                chain.originalRTMOverwritten = true;
+            }
             chain.needsIdentityRestore = deferred;
+            chain.isPatched = true;
             reinstalled++;
             LOG_INFO("[HookManager] Reinstalled dispatch stub: " + chain.targetClass + "::" + chain.targetMethod);
         } else {
@@ -1214,6 +1261,7 @@ void HookManager::BackupOriginalMethod(HookChain& chain) {
     }
 
     chain.trampolineMethod = trampoline;
+    m_trampolineToOriginal[trampoline] = chain.originalMethod;
 
     bool inflated = (layout->slotAndFlags & Offsets::METHOD_IS_INFLATED_FLAG) != 0;
     LOG_DEBUG("[HookManager] Backed up original method: token=" + std::to_string(chain.originalToken) + ", trampoline=" + std::to_string((uintptr_t)trampoline) +
@@ -1381,9 +1429,16 @@ bool HookManager::InstallDispatchStub(HookChain& chain) {
     // Sidesteps the can't-re-transform-a-transformed-method problem and preserves the original's identity fields.
     // If proxy compilation fails (never-compiled method), falls back to clobbering token/klass for lazy first-call compilation. deferred identity restoration happens in NativeGetCallerHookToken.
     bool deferred = false;
-    if (!MethodPatcher::Get().ForcePatchMethod(chain.originalMethod, entryHook, &deferred, &chain.installedRTM)) {
+    RuntimeMethod saved = {};
+    void* preInstallRTM = reinterpret_cast<MonoMethodLayout*>(chain.originalMethod)->runtimeMethod;
+    if (!MethodPatcher::Get().ForcePatchMethod(chain.originalMethod, entryHook, &deferred, &chain.installedRTM, &saved)) {
         LOG_ERROR("[HookManager] Failed to patch method: " + chain.targetClass + "::" + chain.targetMethod);
         return false;
+    }
+    // In-place install on the original's own RTM: keep the pre-overwrite bytes for unhook
+    if (!chain.isPatched && preInstallRTM && chain.installedRTM == preInstallRTM) {
+        chain.savedOriginalRTM = saved;
+        chain.originalRTMOverwritten = true;
     }
 
     chain.isPatched = true;
@@ -1986,6 +2041,7 @@ void* HookManager::ContinueBakedChain(void* originalMethod, size_t fromLinkIndex
     // Instance chains: linkMethod was re-signed instance (STATIC cleared), so runtime-invoke delivers thisPtr as the receiver - the leading-self convention
     MonoBridge::Get().SetupTLS();
     MonoInvokeState st = {};
+    InvokeBridge bridge;
     bool ok = MonoBridge::Get().InvokeMethod(nextMethod, thisPtr, params, &st);
     if (!ok) {
         std::string excMsg = ExtractExceptionInfo(st.pThrowExc);
@@ -2026,6 +2082,7 @@ void* HookManager::InvokeOriginal(void* originalMethod, void* thisPtr, void** pa
     MonoBridge::Get().SetupTLS();
 
     // Invoke using the trampoline
+    InvokeBridge bridge;
     MonoInvokeState state = {};
     bool invokeResult = MonoBridge::Get().InvokeMethod(chain->trampolineMethod, thisPtr, params, &state);
 
@@ -2163,16 +2220,27 @@ static bool IsValueTypeClass(void* klass) {
 static std::vector<void*> UnboxParametersFast(void* argsArray, const HookChain* chain) {
     std::vector<void*> unboxedParams;
 
-    if (!argsArray) return unboxedParams;
+    int32_t arrayLen = argsArray ? MonoBridge::Get().GetArrayLength(argsArray) : 0;
+    if (arrayLen < 0) arrayLen = 0;
 
-    int32_t arrayLen = MonoBridge::Get().GetArrayLength(argsArray);
-    if (arrayLen <= 0) return unboxedParams;
+    // ARG COUNT GUARD - the invoke marshals sig->param_count entries off ppParams regardless of what we hand it, so a short array is an AV inside interp_mono_invoke_with_state
+    // Pad to the signature (null for ref types, a zeroed slot for value types) and say why once per chain; the usual cause is llikely C# `params` swallowing an object[] argument
+    static const uint8_t s_zeroSlot[64] = {0};
+    static std::unordered_set<const HookChain*> s_countWarned;
+    int32_t sigCount = (chain && chain->signatureCached) ? chain->cachedParamCount : arrayLen;
+    if (arrayLen != sigCount && s_countWarned.insert(chain).second) {
+        LOG_ERROR("[HookManager] " + chain->targetClass + "::" + chain->targetMethod + " called through CallNext/CallOriginal with " + std::to_string(arrayLen) + " arg(s), signature has " + std::to_string(sigCount) +
+                  (arrayLen < sigCount ? " - padding with defaults. If the target takes a single object[], wrap it: CallNext(self, new object[] { arr })" : " - extra args ignored"));
+    }
+    if (arrayLen == 0 && sigCount == 0) return unboxedParams;
 
-    unboxedParams.resize(arrayLen);
-    void** arrayElements = (void**)((uintptr_t)argsArray + 0x10);
+    unboxedParams.resize(sigCount);
+    void** arrayElements = argsArray ? (void**)((uintptr_t)argsArray + 0x10) : nullptr;
+    for (int32_t i = arrayLen; i < sigCount; i++) { unboxedParams[i] = chain->cachedParamIsValueType[i] ? (void*)s_zeroSlot : nullptr; }
+    if (arrayLen > sigCount) arrayLen = sigCount;
 
     // Use cached param info if available and matches
-    bool useCached = chain && chain->signatureCached && (size_t)arrayLen == chain->cachedParamIsValueType.size();
+    bool useCached = chain && chain->signatureCached && (size_t)sigCount == chain->cachedParamIsValueType.size();
 
     for (int32_t i = 0; i < arrayLen; i++) {
         void* boxedValue = arrayElements[i];
@@ -2342,7 +2410,11 @@ void* __cdecl HookManager::NativeCallNext(uint32_t methodToken, void* thisPtr, v
         // Invoke next hook; it may call CallNext recursively to continue chain.
         // WARNING: after this call, 'state' pointer may be invalid due to vector reallocation.
         MonoInvokeState invokeState = {};
-        bool success = MonoBridge::Get().InvokeMethod(nextHook.hookMethod, invokeThisPtr, invokeParams, &invokeState);
+        bool success;
+        {
+            InvokeBridge bridge;
+            success = MonoBridge::Get().InvokeMethod(nextHook.hookMethod, invokeThisPtr, invokeParams, &invokeState);
+        }
 
         if (!success) {
             std::string excMsg = ExtractExceptionInfo(invokeState.pThrowExc);
@@ -2472,6 +2544,195 @@ uint32_t __cdecl HookManager::NativeGetCallerHookToken() {
 
     LOG_WARN("[HookManager] NativeGetCallerHookToken: no hook found in call stack");
     return 0;
+}
+
+// CALLER FRAME - the game frame that called the innermost hooked method
+// Every chain frame back-points RTM->method to the hooked target: the boxing dispatch stub, the baked head/links (ChainCompiler sets it) and the trampoline (MethodPatcher fixes it)
+// So the walk is: skip everything until a frame resolves to a chain (our ICALL, handlers, S3MM.Chain helpers), skip the rest of that chain, the next frame is the caller
+// parent == NULL is the entry frame of a fresh-context runtime-invoke, i.e. a native/engine caller - reported as "no caller", not "fixed"
+static void* FrameMethod(InterpFrame* frame) {
+    RuntimeMethod* rtm = frame->runtime_method;
+    if (!IsValidPointer(rtm) || !IsValidPointer(rtm->method)) return nullptr;
+    return rtm->method;
+}
+
+// The original body runs in the trampoline clone (its own RTM, back-pointer to the clone), so those frames read as the clone unless mapped back
+void* HookManager::CanonicalFrameMethod(InterpFrame* frame) {
+    void* method = FrameMethod(frame);
+    if (!method) return nullptr;
+    auto it = m_trampolineToOriginal.find(method);
+    return it == m_trampolineToOriginal.end() ? method : it->second;
+}
+
+// mono_interp_transform_method substitutes mono_marshal_get_delegate_invoke for <Delegate>.Invoke, so exactly one wrapper frame sits between a delegate caller and the target
+static bool IsDelegateInvokeWrapper(void* method) {
+    uintptr_t mdAddr = Addresses::Defaults.multicastdelegate_class;
+    if (!mdAddr || !IsValidPointer(method)) return false;
+    void* multicast = *(void**)mdAddr;
+    auto* layout = reinterpret_cast<MonoMethodLayout*>(method);
+    if (!multicast || !IsValidPointer(layout->klass) || !IsValidPointer((void*)layout->name)) return false;
+    return *(void**)((uintptr_t)layout->klass + Offsets::CLASS_PARENT) == multicast && strcmp(layout->name, "Invoke") == 0;
+}
+
+// DIAG - first few failed walks dump the chain they saw (method names innermost-first), so a "native caller" verdict can be checked against reality
+static void LogFailedCallerWalk(InterpFrame* start, const char* why) {
+    static int budget = 5;
+    if (budget <= 0) return;
+    budget--;
+    std::string chain;
+    int n = 0;
+    size_t bridge = t_invokeBridges.size();
+    for (InterpFrame* f = start; f && n < 32 && IsValidPointer(f); ++n) {
+        void* m = FrameMethod(f);
+        chain += (n ? " <- " : "") + (m ? MonoBridge::GetMethodFullName(m) : std::string("<no method>"));
+        f = f->parent;
+        if (!f && bridge > 0) {
+            f = t_invokeBridges[--bridge];
+            chain += " <-[bridge]";
+        }
+    }
+    LOG_DEBUG(std::string("[HookManager] GetCaller walk failed (") + why + "): " + chain);
+}
+
+bool HookManager::ResolveCallerFrameUnguarded(InterpFrame* frame, CallerFrame& out) {
+    InterpFrame* start = frame;
+    void* chainTarget = nullptr;
+    size_t bridge = t_invokeBridges.size(); // consumed innermost-first as NULL parents are crossed
+    for (int depth = 0; frame && depth < 32; ++depth) {
+        if (!IsValidPointer(frame)) return false;
+        void* method = CanonicalFrameMethod(frame);
+        InterpFrame* next = frame->parent;
+        if (!next && bridge > 0) next = t_invokeBridges[--bridge];
+
+        if (!chainTarget) {
+            if (method && m_chains.count(method)) chainTarget = method;
+            frame = next;
+            continue;
+        }
+        if (method == chainTarget || IsDelegateInvokeWrapper(method)) {
+            frame = next;
+            continue;
+        }
+        if (!method) {
+            LogFailedCallerWalk(start, "frame without method after chain");
+            return false;
+        }
+
+        // A frame of ANOTHER chain: a baked link running a handler reports that handler, the trampoline/stub reports the target itself
+        auto compIt = m_compiledChains.find(method);
+        if (compIt != m_compiledChains.end()) {
+            RuntimeMethod* rtm = frame->runtime_method;
+            for (size_t i = 0; i < compIt->second.links.size(); ++i) {
+                if (compIt->second.links[i].linkRTM == rtm || (i == 0 && rtm == compIt->second.headRTM)) {
+                    method = compIt->second.links[i].userMethod;
+                    break;
+                }
+            }
+        }
+        out.frame = frame;
+        out.method = method;
+        return true;
+    }
+    LogFailedCallerWalk(start, chainTarget ? "chain is the entry frame (parent NULL)" : "no chain frame found");
+    return false;
+}
+
+bool HookManager::ResolveCallerFrame(CallerFrame& out) {
+    out = CallerFrame{};
+    if (!Addresses::Profiler.g_thread_context_tls_index) return false;
+    void* ctx = TlsGetValue(*(DWORD*)Addresses::Profiler.g_thread_context_tls_index);
+    if (!ctx) return false;
+    __try {
+        return ResolveCallerFrameUnguarded(reinterpret_cast<ThreadContext*>(ctx)->current_frame, out);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Box one value stored at `src` as `monoType`; reference types are read as the object pointer, value types (primitives, structs, enums, generic structs) copy via mono_value_box
+// availableBytes bounds the copy for args-area slots; 0 = unbounded (a by-ref pointee is real storage of that type)
+static void* BoxTypedValue(void* monoType, const void* src, uint32_t availableBytes, const char* site) {
+    using class_from_type_t = void*(__cdecl*)(void* monoType, void* context);
+    auto classFromType = reinterpret_cast<class_from_type_t>(Addresses::Classes.SPEC_mono_class_from_mono_type);
+    if (!classFromType || !IsValidPointer(monoType)) return nullptr;
+    void* klass = classFromType(monoType, nullptr);
+    if (!IsValidPointer(klass)) return nullptr;
+
+    bool isValueType = (*(uint8_t*)((uintptr_t)klass + Offsets::CLASS_FLAGS_BYTE) & Offsets::CLASS_FLAG_VALUETYPE) != 0;
+    if (!isValueType) return *(void**)src;
+    if (availableBytes == 0) return MonoBridge::Get().BoxValue(klass, const_cast<void*>(src));
+    return MonoBridge::Get().BoxValueChecked(klass, const_cast<void*>(src), availableBytes, site);
+}
+
+void* __cdecl HookManager::NativeCallerMethod() {
+    CallerFrame cf;
+    return HookManager::Get().ResolveCallerFrame(cf) ? cf.method : nullptr;
+}
+
+void* __cdecl HookManager::NativeCallerName() {
+    CallerFrame cf;
+    if (!HookManager::Get().ResolveCallerFrame(cf)) return nullptr;
+    return MonoBridge::Get().CreateString(MonoBridge::GetMethodFullName(cf.method).c_str());
+}
+
+int32_t __cdecl HookManager::NativeCallerIs(void* nameStr) {
+    CallerFrame cf;
+    if (!nameStr || !HookManager::Get().ResolveCallerFrame(cf)) return 0;
+    return MonoBridge::GetMethodFullName(cf.method) == MonoBridge::Get().ExtractString(nameStr) ? 1 : 0;
+}
+
+// Struct receivers arrive as a payload pointer (interior or box+4), so hand out a boxed copy rather than the pointer
+void* __cdecl HookManager::NativeCallerInstance() {
+    CallerFrame cf;
+    if (!HookManager::Get().ResolveCallerFrame(cf) || !cf.frame->obj) return nullptr;
+    void* klass = reinterpret_cast<MonoMethodLayout*>(cf.method)->klass;
+    if (!IsValidPointer(klass)) return nullptr;
+    if (*(uint8_t*)((uintptr_t)klass + Offsets::CLASS_FLAGS_BYTE) & Offsets::CLASS_FLAG_VALUETYPE) return MonoBridge::Get().BoxValue(klass, cf.frame->obj);
+    return cf.frame->obj;
+}
+
+// Args live in the frame's private args area (frame->args + rtm->arg_offsets[i]) at native widths, value types inline - same recipe DumpBakedCrashRecord validated
+// By-ref slots hold a managed pointer into a live ancestor frame: deref'd and copied here, never handed out
+void* __cdecl HookManager::NativeCallerArgs() {
+    CallerFrame cf;
+    if (!HookManager::Get().ResolveCallerFrame(cf)) return nullptr;
+
+    RuntimeMethod* rtm = cf.frame->runtime_method;
+    void* sig = MonoBridge::Get().GetMethodSignature(cf.method);
+    if (!IsReadablePointer(sig, Offsets::SIG_PARAMS) || !IsReadablePointer(rtm, sizeof(RuntimeMethod))) return nullptr;
+
+    uint16_t nParams = *(uint16_t*)((uintptr_t)sig + Offsets::SIG_PARAM_COUNT);
+    if (rtm->param_count < nParams) nParams = rtm->param_count;
+    auto* args = reinterpret_cast<const uint8_t*>(cf.frame->args);
+    uint16_t argsSize = rtm->args_size;
+    if (nParams > 0 && (!IsReadablePointer(const_cast<uint8_t*>(args), argsSize) || !IsReadablePointer(rtm->arg_offsets, nParams * sizeof(uint32_t)))) return nullptr;
+
+    void* objectKlass = MonoBridge::Get().GetClassByName("System", "Object");
+    void* array = objectKlass ? MonoBridge::Get().CreateArray(objectKlass, nParams) : nullptr;
+    if (!array) return nullptr;
+
+    for (uint16_t i = 0; i < nParams; ++i) {
+        void* paramType = *(void**)((uintptr_t)sig + Offsets::SIG_PARAMS + i * sizeof(void*));
+        uint32_t off = rtm->arg_offsets[i];
+        if (off + 4 > argsSize) continue; // slot outside the args area: leave null
+        const uint8_t* src = args + off;
+
+        void* boxed = nullptr;
+        if (ChainCompiler::TypeIsByRef(paramType)) {
+            void* pointee = *(void**)src;
+            if (IsValidPointer(pointee)) boxed = BoxTypedValue(paramType, pointee, 0, "CallerArgs byref");
+        } else {
+            boxed = BoxTypedValue(paramType, src, argsSize - off, "CallerArgs");
+        }
+        if (void* elem = MonoBridge::Get().GetArrayElementPtr(array, i, sizeof(void*))) *(void**)elem = boxed;
+    }
+    return array;
+}
+
+uint32_t __cdecl HookManager::NativeCallerMintOffset() {
+    CallerFrame cf;
+    if (!HookManager::Get().ResolveCallerFrame(cf)) return 0;
+    RuntimeMethod* rtm = cf.frame->runtime_method;
+    if (!IsValidPointer(rtm) || !cf.frame->ip || (uintptr_t)cf.frame->ip < (uintptr_t)rtm->code) return 0;
+    return (uint32_t)((uintptr_t)cf.frame->ip - (uintptr_t)rtm->code);
 }
 
 // AUTO-PREFIXED LOG - Walk frames to resolve calling mod's assembly name, skipping S3MM.Helper
@@ -2615,9 +2876,13 @@ void* __cdecl HookManager::NativeDispatch(uint32_t methodToken, void* thisPtr, v
 
     MonoBridge::Get().SetupTLS();
     MonoInvokeState invokeState = {};
-    bool success = MonoBridge::Get().InvokeMethod(firstHook.hookMethod,
-        nullptr, // hooks are static, no 'this'
-        invokeParams, &invokeState);
+    bool success;
+    {
+        InvokeBridge bridge;
+        success = MonoBridge::Get().InvokeMethod(firstHook.hookMethod,
+            nullptr, // hooks are static, no 'this'
+            invokeParams, &invokeState);
+    }
 
     if (!success) {
         std::string excMsg = ExtractExceptionInfo(invokeState.pThrowExc);

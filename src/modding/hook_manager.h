@@ -51,8 +51,11 @@ struct HookChain {
     bool bakedActive = false;     // Installed via the baked ChainCompiler path (not the boxing dispatch stub)
     std::string bakeRejectReason; // Why this chain didn't bake ("" if baked or never attempted); a demoted hook still runs boxed
 
-    // The RuntimeMethod* transplanted onto the original at first install
+    // The RuntimeMethod* the dispatch stub lives in: the original's own RTM when it existed at install (overwritten in place), else the transplanted one
     void* installedRTM = nullptr;
+    // Pre-overwrite bytes of the original's RTM, copied back on unhook so callers that bound that pointer run the original again
+    RuntimeMethod savedOriginalRTM = {};
+    bool originalRTMOverwritten = false;
     bool originalIsInstance = false;   // True if original method is instance (not static)
     bool needsIdentityRestore = false; // True if identity was clobbered (deferred proxy compilation failed)
 
@@ -151,6 +154,15 @@ class HookManager {
     // The boxing Chain.CallNext fallback needs hasThis to split a leading-self arg from the forwarded params
     static int32_t __cdecl NativeTargetIsInstance(uint32_t methodToken);
 
+    // CALLER ICALLs (S3MM.Hook.Caller*) - the game frame that called the innermost hooked method; every call re-walks so nothing is captured unless asked
+    // Method/Is are allocation-free, Name allocates the string, Instance is a pointer read (boxed copy for struct receivers), Args boxes a copy of every param
+    static void* __cdecl NativeCallerMethod(); // canonical MonoMethod* (never a chain clone); null = native/engine caller or no hook context
+    static void* __cdecl NativeCallerName();   // "Namespace.Class::Method" or null
+    static int32_t __cdecl NativeCallerIs(void* nameStr);
+    static void* __cdecl NativeCallerInstance();      // null for statics
+    static void* __cdecl NativeCallerArgs();          // object[] in signature order, by-ref params deref'd; null if unreadable
+    static uint32_t __cdecl NativeCallerMintOffset(); // frame->ip - rtm->code: tells call sites apart, never maps to IL
+
     // Auto-prefixed log ICALLs - resolve caller assembly name from interpreter frames
     static void __cdecl NativeLogInfo(void* messageStr);
     static void __cdecl NativeLogWarn(void* messageStr);
@@ -246,6 +258,15 @@ class HookManager {
     // Used by NativeCallNext to route a ShimHook link's boxing Hook.CallNext into ContinueBakedChain
     int FindCallerBakedLinkIndex(void* originalMethod);
 
+    // CALLER FRAME - the frame pointer is only valid for the current hook activation (pool slots are reused after the join), so ICALLs hand out copies, never the frame
+    struct CallerFrame {
+        InterpFrame* frame = nullptr;
+        void* method = nullptr; // canonical MonoMethod*
+    };
+    bool ResolveCallerFrame(CallerFrame& out);
+    bool ResolveCallerFrameUnguarded(InterpFrame* frame, CallerFrame& out);
+    void* CanonicalFrameMethod(InterpFrame* frame);
+
     // Cache signature info for a chain (speedup: avoid re-reading every call)
     void CacheSignatureInfo(HookChain& chain);
 
@@ -277,6 +298,9 @@ class HookManager {
 
     // Map from hook method pointer to target method token (for auto-token resolution in hook[0])
     std::unordered_map<void*, uint32_t> m_hookMethodToToken;
+
+    // Trampoline clone MonoMethod* -> original (frames running the original body identify by the clone)
+    std::unordered_map<void*, void*> m_trampolineToOriginal;
 
     // Map from (image, hookToken) to target method token; key is (imagePtr << 32) | token to avoid cross-assembly collisions
     std::unordered_map<uint64_t, uint32_t> m_hookTokenToTargetToken;

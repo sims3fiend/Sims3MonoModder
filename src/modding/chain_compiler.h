@@ -61,8 +61,10 @@ struct ChainLink {
 
 // COMPILED CHAIN - the baked dispatch structure for one target method
 struct CompiledChain {
-    void* targetMethod = nullptr;  // game MonoMethod* (identity preserved; head)
-    void* headRTM = nullptr;       // installed at targetMethod->runtimeMethod; overwritten IN PLACE on recompile
+    void* targetMethod = nullptr;        // game MonoMethod* (identity preserved; head)
+    void* headRTM = nullptr;             // the RTM at targetMethod->runtimeMethod: the target's own RTM when it existed at install, else the transplanted link-0 RTM; overwritten IN PLACE on recompile
+    RuntimeMethod savedOriginalRTM = {}; // pre-overwrite bytes of the target's own RTM (restore image for teardown), valid when overwroteOriginal
+    bool overwroteOriginal = false;
     void* trampolineRTM = nullptr; // original method's preserved RTM (tail target); caller supplies it
     SignatureInfo sig;             // target signature
     std::vector<ChainLink> links;  // execution order: watchers..., hooks by priority...; trampoline is implicit tail
