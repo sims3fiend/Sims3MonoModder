@@ -1,4 +1,5 @@
 #include "mod_manager.h"
+#include "persist_bridge.h"
 #include "../core/vanilla_extractor.h"
 #include "../util/logger.h"
 #include "../resources/resource.h"
@@ -163,8 +164,15 @@ bool ModManager::ProcessMods() {
         LOG_ERROR("[ModManager] HookManager initialization failed");
     }
 
+    // Persist bridge - needs the helper loaded and the S3MM.Log icalls registered above
+    PersistBridge::Get().Initialize(ModLoader::Get().GetHelperImage());
+
     // Load all compiled mods
     m_status.modsLoaded = ModLoader::Get().LoadAllMods(m_discoveredMods);
+
+    // Register [PersistableStatic] fields + one SignalAssembliesLoaded for the batch, before OnLoad so it sees tuned values
+    for (const auto& mod : ModLoader::Get().GetLoadedMods()) { PersistBridge::Get().OnModLoaded(mod); }
+    PersistBridge::Get().FlushSignal();
 
     // Apply all hooks (Hook_/Watch_ naming + [S3MM.Hook]/[S3MM.Watcher] attributes)
     int hooksApplied = HookManager::Get().ApplyHooks();

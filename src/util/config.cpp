@@ -70,6 +70,10 @@ void Config::Initialize() {
             m_logHookInvocations = *v;
             LOG_INFO("[Config] LogHookInvocations = " + std::string(m_logHookInvocations ? "true" : "false"));
         }
+        if (auto v = tbl["PersistAutoRegister"].value<bool>()) {
+            m_persistAutoRegister = *v;
+            LOG_INFO("[Config] PersistAutoRegister = " + std::string(m_persistAutoRegister ? "true" : "false"));
+        }
     } catch (const toml::parse_error& err) { LOG_INFO("[Config] Could not parse config (" + std::string(err.what()) + "), using defaults"); }
 
     // Apply verbose flag to logger. Note: config loads after Logger::Initialize, so the earliest startup lines (address resolution, image hooks) already emitted at the build default
@@ -98,6 +102,7 @@ void Config::Save() {
     tbl.insert("FontSize", static_cast<int64_t>(m_fontSize));
     tbl.insert("Verbose", m_verbose);
     tbl.insert("LogHookInvocations", m_logHookInvocations);
+    tbl.insert("PersistAutoRegister", m_persistAutoRegister);
     file << tbl;
 
     LOG_INFO("[Config] Saved successfully");
@@ -163,6 +168,11 @@ void Config::SetVerbose(bool verbose) {
     Logger::Get().SetMinLevel(verbose ? Logger::Level::Debug : Logger::Level::Info);
     LOG_INFO("[Config] Verbose logging " + std::string(verbose ? "enabled" : "disabled"));
     Save();
+}
+
+bool Config::IsPersistAutoRegister() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_persistAutoRegister;
 }
 
 bool Config::IsLogHookInvocations() const {

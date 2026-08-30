@@ -1,4 +1,5 @@
 #include "mod_loader.h"
+#include "persist_bridge.h"
 #include "mod_compiler.h"
 #include "hook_manager.h"
 #include "../core/mono_bridge.h"
@@ -1100,6 +1101,10 @@ bool ModLoader::HotReloadMod(const std::string& modName) {
 
         // Apply new hook chains (previously unhooked methods need a fresh install via ApplyHooks).
         int newlyApplied = HookManager::Get().ApplyHooks();
+
+        // Re-point persisted statics at the new image (managed side knows the previous image by mod name), before OnLoad so it sees carried/tuned values
+        PersistBridge::Get().OnModLoaded(mod);
+        PersistBridge::Get().FlushSignal();
 
         // Fire OnLoad callbacks for the reloaded mod (hooks are now active)
         FireOnLoadCallbacks(modName);

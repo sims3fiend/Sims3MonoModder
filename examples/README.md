@@ -151,3 +151,12 @@ You get the caller of the *innermost* hooked method below you, so a target calle
 ### Use `[S3MM.OnLoad]`, not static constructors
 
 An exception in a static constructor becomes a permanent `TypeInitializationException`; the type is dead for the rest of the session. `[S3MM.OnLoad]` runs after your hooks are registered and applied, exceptions are caught and logged with your mod's name attribution, multiple OnLoad methods are supported, and it re-fires after hot-reload. Pair it with `[S3MM.OnUnload]` (runs before hooks are torn down) to restore any game state you changed; see the sleep-ticks save/restore pattern in ExampleMod.
+
+### Persisting data in the save: `[PersistableStatic]`
+
+Mark the assembly (`[assembly: PersistableStatic]` at the top of a source file) and each static field you want saved with `[PersistableStatic]`; the field is written into the save game and restored on load. This is what valinna mods use and the save format is identical, so data should move if a mod migrates. See `_cheatUsesEver` in ExampleMod.
+
+- Game/mscorlib types (`int`, `string`, `Dictionary<K,V>`, ...) work. A type defined in your own mod persists too if you mark it `[Persistable]`.
+- On hot-reload S3MM re-registers the fields on the new image and carries current values across , except values whose type is defined in the mod itself (they reset to default so stage them in `[S3MM.OnUnload]`/`[S3MM.OnLoad]` if you need them to survive).
+- `[PersistableStatic(true)]` (`LoadFromMainMenuOnly`) should be honored the same way vanilla honors it.
+- A save written before your mod existed loads fine (missing entries are simply absent), and removing the mod later doesn't break the save. I may migrate this entire system to a more S3MM controlled one or do some sort of bigger save-touching thing in the future, but this will likely remain in the API regardless.

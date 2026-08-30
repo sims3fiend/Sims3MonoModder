@@ -4,6 +4,9 @@ using Sims3.Gameplay.Actors;
 using Sims3.Gameplay.Autonomy; // MetaAutonomyVenueType (enum-return hook demo)
 using Sims3.SimIFace;
 
+// Opt this assembly into save persistence
+[assembly: PersistableStatic]
+
 // S3MM showcase / template mod. NOT a real gameplay mod
 // Should hopefuly show most major parts of the S3MM API in one file so people can copy-paste/learn the API
 // In-game: type `examplemod` at the cheat console (Ctrl+Shift+C) for a status dump, `examplemod skip` to fire the skip-original demo, or `examplemod generic` to drive the generic-target hook
@@ -54,6 +57,16 @@ public static class ExampleMod
     // Original value of a static field we tweak in OnLoad - restored in OnUnload so hot-reload leaves the game clean.
     private static uint _originalSleepTicks;
     private static bool _didTweakSleepTicks;
+
+    // --- Save persistence ([PersistableStatic]) ---
+    // A static field with this attribute is written into the save game and restored on load.
+    // Same mechanism and save format as script .package mods, so data survives a .package <-> loose DLL migration.
+    // Needs the [assembly: PersistableStatic] gate at the top of the file (same as vanilla)
+    // Hot-reload re-registers the field on the new image and carries the current value across.
+    // Game/mscorlib field types (int, string, Dictionary<K,V>, ...) just just werk.
+    // A type defined in this mod persists too if marked [Persistable], but resets on hot-reload (stage it in OnUnload/OnLoad if you need it)
+    [PersistableStatic]
+    private static int _cheatUsesEver; // bumped by every `examplemod` status dump - save, reload, and the count continues
 
     // --- Lifecycle: OnLoad installs, OnUnload restores ---
     [S3MM.OnLoad]
@@ -639,8 +652,14 @@ public static class ExampleMod
         if (sub == "generic")
             return CheatGenericDemo();
 
+        _cheatUsesEver++;
         S3MM.Log.Info("======== examplemod status ========");
         S3MM.Log.Info("S3MM API version       : " + S3MM.Version.Api);
+        S3MM.Log.Info(
+            "Status dumps ever      : "
+                + _cheatUsesEver
+                + " ([PersistableStatic] - survives save/load)"
+        );
         S3MM.Log.Info("Loaded mods            : " + S3MM.Audit.GetLoadedModCount());
         S3MM.Log.Info("Hooked methods         : " + S3MM.Audit.GetHookedMethodCount());
         S3MM.Log.Info("CoinFlips observed     : " + _coinFlipsObserved);

@@ -146,6 +146,7 @@
     <ClInclude Include="src\ui\themes.h" />
     <ClInclude Include="src\modding\mod_manager.h" />
     <ClInclude Include="src\modding\mod_loader.h" />
+    <ClInclude Include="src\modding\persist_bridge.h" />
     <ClInclude Include="src\modding\mod_compiler.h" />
     <ClInclude Include="src\modding\method_patcher.h" />
     <ClInclude Include="src\modding\hook_manager.h" />
@@ -195,6 +196,7 @@
     <ClCompile Include="src\ui\themes.cpp" />
     <ClCompile Include="src\modding\mod_manager.cpp" />
     <ClCompile Include="src\modding\mod_loader.cpp" />
+    <ClCompile Include="src\modding\persist_bridge.cpp" />
     <ClCompile Include="src\modding\mod_compiler.cpp" />
     <ClCompile Include="src\modding\method_patcher.cpp" />
     <ClCompile Include="src\modding\hook_manager.cpp" />

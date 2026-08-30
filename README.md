@@ -41,11 +41,13 @@ Contact me on [Tumblr](https://sims3fiend.tumblr.com/) | [Discord](https://disco
 
 4. Place mods in `Documents\Electronic Arts\The Sims 3\S3MM\`: compiled `.dll`s go in `S3MM\Mods\`, bare `.cs` sources go in `S3MM\Source\<ModName>\`. They get picked up on starting the game and via the Mods panel's **Scan for New Mods** button.
 
-## Logging flags
+## TOML flags
 
-Set in `S3MM.toml` (both default `false`):
+Logging flags (both default `false`):
 - **`Verbose = true`** - DEBUG-level logging
 - **`LogHookInvocations = true`** - traces every hook dispatch (chain entry, `CallNext` steps, return boxing). Independent of `Verbose`. Spams a lot of lines.
+Not logging flags:
+- **`PersistAutoRegister`** (default `true`) - register `[PersistableStatic]` fields of S3MM-loaded mods so they survive save/load. Set `false` to disable the whole persist bridge (for debugging). Don't do this. I'll probably remove this and maybe the other flags in the future just so people can't do this.
 
 ## Example Mod
 

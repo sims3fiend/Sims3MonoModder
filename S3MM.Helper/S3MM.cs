@@ -1,4 +1,7 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 
 namespace S3MM
@@ -50,6 +53,321 @@ namespace S3MM
 
         [MethodImpl(MethodImplOptions.InternalCall)]
         internal static extern uint CallerMintOffset();
+    }
+
+    /// <summary>
+    /// Internal: late [PersistableStatic] registration for S3MM-loaded assemblies. Driven by native (persist_bridge.cpp), mods never call this.
+    /// PersistStatic.GameplayInitialize scans the AppDomain once in StartupState, S3MM loads mods after that, so their statics never entered sPersistList.
+    /// Same rules as vanilla ([assembly: PersistableStatic] gate, PersistStatic.IsFieldSerializable)
+    /// Hot-reload: drops the old image's entries (matched by RuntimeFieldHandle VALUE, never by Assembly object identity - reflection wrappers are
+    /// per-domain-cached and an object obtained on the game thread at startup is not reference-equal to one obtained on the sim thread later)
+    /// and carries static values across. No Persist.TypeFound remap is needed: mono prepends to domain_assemblies, so GetTypeByUnqualifiedName
+    /// already resolves unqualified type refs to the NEWEST image. Simulator.SignalAssembliesLoaded is fired so [Tunable] XML applies h-heh..
+    /// </summary>
+    internal static class PersistBridge
+    {
+        private const BindingFlags kStaticAny =
+            BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic;
+        private const BindingFlags kAnyInstance =
+            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+
+        private static bool sInstalled;
+        private static Type sAttrType; // Sims3.SimIFace.PersistableStaticAttribute
+        private static ConstructorInfo sPersistVarCtor; // PersistStatic+PersistVariable(RuntimeFieldHandle)
+        private static FieldInfo sListField; // PersistStatic.sPersistList : List<PersistVariable>, null = disabled
+        private static FieldInfo sPvHandleField; // PersistVariable.mField : RuntimeFieldHandle
+        private static MethodInfo sIsFieldSerializable; // PersistStatic.IsFieldSerializable(FieldInfo) : bool
+        private static MethodInfo sSignalAssembliesLoaded; // Simulator.SignalAssembliesLoaded(Assembly[]), private
+
+        // Hot-reload tracking: logical name -> newest image, and the handle values (MonoClassField*) we registered for it
+        private static readonly Dictionary<string, Assembly> sLatestByMod =
+            new Dictionary<string, Assembly>();
+        private static readonly Dictionary<string, Dictionary<IntPtr, bool>> sHandlesByMod =
+            new Dictionary<string, Dictionary<IntPtr, bool>>();
+        private static readonly List<Assembly> sPendingSignal = new List<Assembly>();
+
+        /// <summary>Resolve game internals and subscribe Persist.TypeFound. Once, after S3MM.Helper is loaded.</summary>
+        internal static void Install()
+        {
+            if (sInstalled)
+                return;
+            sInstalled = true;
+            try
+            {
+                Type persistStatic = Type.GetType("Sims3.SimIFace.PersistStatic, SimIFace", true);
+                sAttrType = Type.GetType(
+                    "Sims3.SimIFace.PersistableStaticAttribute, SimIFace",
+                    true
+                );
+                Type persistVar = persistStatic.GetNestedType(
+                    "PersistVariable",
+                    BindingFlags.Public | BindingFlags.NonPublic
+                );
+                sListField = persistStatic.GetField("sPersistList", kStaticAny);
+                sIsFieldSerializable = persistStatic.GetMethod(
+                    "IsFieldSerializable",
+                    kStaticAny,
+                    null,
+                    new Type[] { typeof(FieldInfo) },
+                    null
+                );
+                if (persistVar == null || sListField == null || sIsFieldSerializable == null)
+                    throw new MissingMemberException(
+                        "PersistStatic internals not found (sPersistList / PersistVariable / IsFieldSerializable)"
+                    );
+
+                sPvHandleField = persistVar.GetField("mField", kAnyInstance);
+                sPersistVarCtor = persistVar.GetConstructor(
+                    kAnyInstance,
+                    null,
+                    new Type[] { typeof(RuntimeFieldHandle) },
+                    null
+                );
+                if (sPvHandleField == null || sPersistVarCtor == null)
+                    throw new MissingMemberException(
+                        "PersistVariable layout changed (mField / ctor(RuntimeFieldHandle))"
+                    );
+
+                Type simulator = Type.GetType("Sims3.SimIFace.Simulator, SimIFace", true);
+                sSignalAssembliesLoaded = simulator.GetMethod(
+                    "SignalAssembliesLoaded",
+                    kStaticAny,
+                    null,
+                    new Type[] { typeof(Assembly[]) },
+                    null
+                );
+                if (sSignalAssembliesLoaded == null)
+                    Log.Warn(
+                        "[PersistBridge] Simulator.SignalAssembliesLoaded not found - [Tunable] XML will not apply to S3MM mods"
+                    );
+
+                Log.Info("[PersistBridge] Installed");
+            }
+            catch (Exception ex)
+            {
+                sListField = null;
+                Log.Error(
+                    "[PersistBridge] Install failed - [PersistableStatic] auto-registration disabled: "
+                        + Describe(ex)
+                );
+            }
+        }
+
+        /// <summary>Register a loaded mod's fields and queue it for SignalAssembliesLoaded. A mod name seen before is a hot-reload: the previous image's entries are dropped and its statics carried across.</summary>
+        internal static void OnModLoaded(string assemblyName, string modName)
+        {
+            if (sListField == null)
+                return;
+            Assembly asm = FindAssembly(assemblyName);
+            if (asm == null)
+            {
+                Log.Warn(
+                    "[PersistBridge] Assembly '"
+                        + assemblyName
+                        + "' not found in AppDomain - [PersistableStatic] fields of "
+                        + modName
+                        + " will not persist"
+                );
+                return;
+            }
+            Assembly prev;
+            sLatestByMod.TryGetValue(modName, out prev);
+            if (prev == asm)
+                return; // already registered
+
+            int removed = 0,
+                carried = 0;
+            if (prev != null)
+            {
+                removed = UnregisterMod(modName);
+                carried = CarryStatics(prev, asm, modName);
+            }
+            sLatestByMod[modName] = asm;
+            int added = RegisterAssembly(asm, modName);
+
+            if (prev != null)
+                Log.Info(
+                    "[PersistBridge] "
+                        + modName
+                        + " reloaded: "
+                        + removed
+                        + " stale entries dropped, "
+                        + carried
+                        + " static values carried, "
+                        + added
+                        + " fields registered"
+                );
+            else if (added > 0)
+                Log.Info(
+                    "[PersistBridge] "
+                        + modName
+                        + ": registered "
+                        + added
+                        + " [PersistableStatic] field(s)"
+                );
+            sPendingSignal.Add(asm);
+        }
+
+        /// <summary>Simulator.SignalAssembliesLoaded for everything queued since the last flush (TuningControl applies [Tunable] XML here).</summary>
+        internal static void FlushSignal()
+        {
+            if (sPendingSignal.Count == 0)
+                return;
+            Assembly[] batch = sPendingSignal.ToArray();
+            sPendingSignal.Clear();
+            if (sSignalAssembliesLoaded == null)
+                return;
+            try
+            {
+                sSignalAssembliesLoaded.Invoke(null, new object[] { batch });
+                Log.Debug("[PersistBridge] Simulator.SignalAssembliesLoaded(" + batch.Length + ")");
+            }
+            catch (Exception ex)
+            {
+                // Subscriber threw (TuningControl rethrows GetTypes failures). Persistence unaffected
+                Log.Warn("[PersistBridge] OnAssembliesLoaded subscriber threw: " + Describe(ex));
+            }
+        }
+
+        // PersistStatic.GameplayInitialize's scan body for one assembly. Records the handle values so UnregisterMod can drop them on hot-reload
+        private static int RegisterAssembly(Assembly asm, string modName)
+        {
+            if (asm.GetCustomAttributes(sAttrType, true).Length == 0)
+            {
+                Log.Debug(
+                    "[PersistBridge] " + modName + ": no [assembly: PersistableStatic] - skipped"
+                );
+                return 0;
+            }
+            IList list = sListField.GetValue(null) as IList;
+            if (list == null)
+            {
+                Log.Warn(
+                    "[PersistBridge] PersistStatic.sPersistList is null (GameplayInitialize has not run) - skipping "
+                        + modName
+                );
+                return 0;
+            }
+            Dictionary<IntPtr, bool> handles = new Dictionary<IntPtr, bool>();
+            int added = 0;
+            foreach (Type t in SafeGetTypes(asm, modName))
+            {
+                if (t == null)
+                    continue;
+                foreach (FieldInfo f in t.GetFields(kStaticAny))
+                {
+                    if (!(bool)sIsFieldSerializable.Invoke(null, new object[] { f }))
+                        continue;
+                    list.Add(sPersistVarCtor.Invoke(new object[] { f.FieldHandle }));
+                    handles[f.FieldHandle.Value] = true;
+                    added++;
+                    Log.Debug("[PersistBridge] + " + t.FullName + "." + f.Name);
+                }
+            }
+            sHandlesByMod[modName] = handles;
+            return added;
+        }
+
+        // Drop the entries WE registered for this mod's previous image, matched by handle value.
+        //  A RuntimeFieldHandle.Value is the raw MonoClassField* stable for the image's lifetime and thread/wrapper-independent, unlike Assembly reflection object identity
+        private static int UnregisterMod(string modName)
+        {
+            Dictionary<IntPtr, bool> handles;
+            if (!sHandlesByMod.TryGetValue(modName, out handles) || handles.Count == 0)
+                return 0;
+            IList list = sListField.GetValue(null) as IList;
+            if (list == null)
+                return 0;
+            int removed = 0;
+            for (int i = list.Count - 1; i >= 0; i--)
+            {
+                RuntimeFieldHandle h = (RuntimeFieldHandle)sPvHandleField.GetValue(list[i]);
+                if (!handles.ContainsKey(h.Value))
+                    continue;
+                list.RemoveAt(i);
+                removed++;
+            }
+            sHandlesByMod.Remove(modName);
+            return removed;
+        }
+
+        // Copy [PersistableStatic] statics by type/field name. Values typed from the mod itself can't cross images (SetValue throws), that's what OnUnload/OnLoad is for
+        private static int CarryStatics(Assembly oldAsm, Assembly newAsm, string modName)
+        {
+            int carried = 0;
+            foreach (Type ot in SafeGetTypes(oldAsm, modName + " (previous image)"))
+            {
+                if (ot == null)
+                    continue;
+                Type nt = newAsm.GetType(ot.FullName, false);
+                if (nt == null)
+                    continue;
+                foreach (FieldInfo of in ot.GetFields(kStaticAny | BindingFlags.DeclaredOnly))
+                {
+                    if (of.IsLiteral || of.GetCustomAttributes(sAttrType, true).Length == 0)
+                        continue;
+                    FieldInfo nf = nt.GetField(of.Name, kStaticAny | BindingFlags.DeclaredOnly);
+                    if (nf == null || nf.IsLiteral)
+                        continue;
+                    try
+                    {
+                        nf.SetValue(null, of.GetValue(null));
+                        carried++;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Debug(
+                            "[PersistBridge] "
+                                + ot.FullName
+                                + "."
+                                + of.Name
+                                + ": not carried ("
+                                + Describe(ex)
+                                + ")"
+                        );
+                    }
+                }
+            }
+            return carried;
+        }
+
+        // Short name match. Hot-reload images get a unique assembly name (Mod_vN when recompiled, last char patched for in-memory loads), so this is unambiguous
+        private static Assembly FindAssembly(string shortName)
+        {
+            if (shortName == null || shortName.Length == 0)
+                return null;
+            foreach (Assembly a in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                if (new AssemblyName(a.FullName).Name == shortName)
+                    return a;
+            }
+            return null;
+        }
+
+        private static Type[] SafeGetTypes(Assembly asm, string label)
+        {
+            try
+            {
+                return asm.GetTypes();
+            }
+            catch (ReflectionTypeLoadException ex)
+            {
+                Log.Warn(
+                    "[PersistBridge] "
+                        + label
+                        + ": some types failed to load (missing dependency?) - scanning the rest"
+                );
+                return ex.Types ?? new Type[0];
+            }
+        }
+
+        private static string Describe(Exception ex)
+        {
+            TargetInvocationException tie = ex as TargetInvocationException;
+            if (tie != null && tie.InnerException != null)
+                ex = tie.InnerException;
+            return ex.GetType().Name + ": " + ex.Message;
+        }
     }
 
     /// <summary>

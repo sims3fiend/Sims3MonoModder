@@ -34,6 +34,9 @@ class Config {
     bool IsLogHookInvocations() const;
     void SetLogHookInvocations(bool enabled);
 
+    // Persist bridge (modding/persist_bridge.h): register [PersistableStatic] fields of S3MM-loaded mods (vanilla scan runs before mods load). Default true
+    bool IsPersistAutoRegister() const;
+
     // Key name helper for display
     static std::string GetKeyName(UINT vkCode);
 
@@ -56,6 +59,7 @@ class Config {
     int m_fontSize = 13;                   // Explicit px (native = 13)
     bool m_verbose = false;                // Verbose (Debug-level) logging; off by default
     bool m_logHookInvocations = false;     // Per-invocation hook invocation logging; off by default
+    bool m_persistAutoRegister = true;     // Late [PersistableStatic] registration for S3MM mods
     bool m_initialized = false;
 };
 

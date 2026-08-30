@@ -69,6 +69,9 @@ class ModLoader {
     // Takes ownership semantics: buffer can be freed after call (Mono copies internally)
     void* LoadAssemblyFromMemory(const char* data, uint32_t dataSize, const char* name);
 
+    // S3MM.Helper image, null until loaded
+    void* GetHelperImage() const { return m_s3mmHelperImage; }
+
   private:
     ModLoader() = default;
     ~ModLoader() = default;
