@@ -11,10 +11,12 @@
 #include "core/script_host_hook.h"
 #include "core/exception_hook.h"
 #include "cache/mono_cache.h"
+#include "modding/audit_api.h"
 #include "modding/chain_compiler.h"
 #include "modding/mod_manager.h"
 #include "ui/imgui_manager.h"
 #include "ui/main_window.h"
+#include "ui/mod_ui.h"
 #include <Windows.h>
 
 namespace S3MM {
@@ -32,6 +34,9 @@ static void OnMonoRuntimeReady() {
     }
     LOG_INFO("MonoBridge initialized");
 
+    // Mod UI icalls
+    ModUIManager::Get().RegisterInternalCalls();
+
     // CO-RESIDENT MODULE SNAPSHOT - record the other native mod binaries sharing the process (ASIs, proxy DLLs).
     // Attribution only, no probing: the VEH crash path resolves fault addresses against this snapshot so a conflict crash names the real culprit instead of blaming MM.
     Memory::SnapshotModules();
@@ -47,9 +52,29 @@ static void OnMonoRuntimeReady() {
     ChainCompiler::Get().Install();
 
     // Load and patch mods
-    ModManager::Get().ProcessMods();
+    bool modsOk = ModManager::Get().ProcessMods();
 
     ScriptHostHook::Get().SetPhase(InitPhase::Ready);
+
+    // STARTUP TOAST - yummy
+    // Warning severity when ProcessMods failed or any discovered mod didn't make it to loaded
+    if (Config::Get().IsStartupToast()) {
+        const auto& status = ModManager::Get().GetStatus();
+        int hooked = AuditAPI::NativeGetHookedMethodCount();
+        std::string toggleKey = Config::GetKeyName(Config::Get().GetToggleKey());
+
+        std::string text = "S3MM loaded: " + std::to_string(status.modsLoaded) + " mod" + (status.modsLoaded == 1 ? "" : "s") + ", " +
+                           std::to_string(hooked) + " hooked method" + (hooked == 1 ? "" : "s") + ". Press " + toggleKey + " for the overlay";
+        int severity = 0; // Info
+        if (!modsOk || !status.errors.empty()) {
+            text += " (errors - see log)";
+            severity = 2; // Error
+        } else if (status.modsLoaded < status.modsDiscovered) {
+            text += " (" + std::to_string(status.modsDiscovered - status.modsLoaded) + " failed - see log)";
+            severity = 1; // Warning
+        }
+        ModUIManager::Get().PushToast(text, severity, 8000);
+    }
 }
 
 DWORD WINAPI MainThread(LPVOID /*lpParam*/) {

@@ -18,6 +18,14 @@ The API these target lives in [`S3MM.Helper/S3MM.cs`](../S3MM.Helper/S3MM.cs).
 
 > Catch-all for modding gotchas for now. This will move to a proper wiki once one exists.
 
+### UI windows
+
+- **Modifiers are postfix** `.Tooltip`, `.Hover`, `.Color`, `.Style` and `BeginContextMenu()` bind to the last *item* widget emitted before them. Layout ops (`SameLine`, `Separator`, `Spacing`, `Indent`/`Unindent`, `ItemWidth`, `BeginDisabled`/`EndDisabled`) emit no item, so they can sit between a widget and its modifiers.
+- **`Style` / `Color` only apply to `Label`** On anything else they log a warning and do nothing, with no compile-time check.
+- **`Hover` is edge-triggered and opt-in**
+- **Slider `onChange` fires on release** (or on a committed Ctrl+click value), not per frame.
+- **The title-bar X hides, it doesn't close** It fires `OnHidden`, and the window keeps its widgets, handlers and state until `Show()` brings it back. `Close()` drops the GC root on the window and its handlers, and `Show()` won't revive it. `OnClosed` also fires when S3MM force-closes leftover windows on hot-reload, Call `Close()` in `[OnUnload]`.
+
 ### `Chain.CallNext` vs `Hook.CallNext`: which one?
 
 Prefer the typed `S3MM.Chain.CallNext<R, T0, ...>`, first type arg is the return type, the rest are the param types. Baking is automatic: match the target's signature exactly and the chain bakes to zero-overhead native dispatch. If it can't bake (a boxing hook shares the target, a signature mismatch), a by-value typed call transparently falls back to boxing dispatch, so you lose nothing by trying, and should generally try.

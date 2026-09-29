@@ -1,6 +1,7 @@
 #include "mods_panel.h"
 #include "settings_panel.h"
 #include "main_window.h"
+#include "mod_ui.h"
 #include "../modding/mod_manager.h"
 #include "../modding/assembly_diff.h"
 #include "../modding/conflict_detector.h"
@@ -185,6 +186,7 @@ void ModsPanel::RenderModEntry(const LoadedMod& mod) {
     // Mod name with hook count
     std::string label = mod.name + " (" + std::to_string(hookCount) + " hooks)";
 
+    ImGui::AlignTextToFramePadding(); // keeps every row the same height whether or not it has an Open UI button
     bool nodeOpen = ImGui::TreeNodeEx(mod.name.c_str(), flags, "%s", label.c_str());
 
     // Track expansion state
@@ -204,6 +206,31 @@ void ModsPanel::RenderModEntry(const LoadedMod& mod) {
             ModLoader::Get().HotReloadMod(mod.name);
         }
         ImGui::EndPopup();
+    }
+
+    // Right-aligned "Open UI" button - only rendered for mods that actually registered S3MM.UI windows
+    int uiWindows = ModUIManager::Get().CountWindowsForMod(mod.name);
+    if (uiWindows > 0) {
+        std::string btnLabel = uiWindows > 1 ? ("Open UI (" + std::to_string(uiWindows) + ")") : std::string("Open UI");
+        float btnWidth = ImGui::CalcTextSize(btnLabel.c_str()).x + ImGui::GetStyle().FramePadding.x * 2.0f;
+        ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - btnWidth);
+
+        const ImVec4 accent = Colors::Get().accent;
+        ImGui::PushStyleColor(ImGuiCol_Button, Colors::WithAlpha(accent, 0.22f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, Colors::WithAlpha(accent, 0.45f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, Colors::WithAlpha(accent, 0.65f));
+        ImGui::PushStyleColor(ImGuiCol_Text, Colors::Brighten(accent));
+        bool pressed = ImGui::Button((btnLabel + "##ui_" + mod.name).c_str());
+        ImGui::PopStyleColor(4);
+        if (pressed) { ModUIManager::Get().OpenWindowsForMod(mod.name); }
+
+        if (ImGui::IsItemHovered()) {
+            if (uiWindows > 1) {
+                ImGui::SetTooltip("Show and focus this mod's %d UI windows", uiWindows);
+            } else {
+                ImGui::SetTooltip("Show and focus this mod's UI window");
+            }
+        }
     }
 
     // Show hooks if expanded
@@ -446,7 +473,7 @@ void ModsPanel::ScanForNewMods() {
 
             if (newlyLoaded.empty()) return;
 
-            // Apply hooks, then run the OnLoad lifecycle, mirroring ProcessMods. 
+            // Apply hooks, then run the OnLoad lifecycle, mirroring ProcessMods.
             // Without firing OnLoad here, a mod brought in via this path gets its hooks installed but never runs OnLoad
             auto& hookManager = ModManager::Get().GetHookManager();
             int hooks = hookManager.ApplyHooks();

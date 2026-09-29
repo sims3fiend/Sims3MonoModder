@@ -48,6 +48,7 @@ Logging flags (both default `false`):
 - **`LogHookInvocations = true`** - traces every hook dispatch (chain entry, `CallNext` steps, return boxing). Independent of `Verbose`. Spams a lot of lines.
 Not logging flags:
 - **`PersistAutoRegister`** (default `true`) - register `[PersistableStatic]` fields of S3MM-loaded mods so they survive save/load. Set `false` to disable the whole persist bridge (for debugging). Don't do this. I'll probably remove this and maybe the other flags in the future just so people can't do this.
+- **`StartupToast`** (default `true`) - show the "S3MM loaded: N mods, M hooked methods" notification once mods are processed.
 
 ## Example Mod
 
@@ -65,10 +66,10 @@ cmake --build --preset x86-release
 Alternatively open `Sims3MonoModder.vcxproj` directly in Visual Studio and build `Release|Win32` (run `vcpkg install --triplet x86-windows-static` in the repo root first so `vcpkg_installed\` exists).
 
 ## Roadmap
-- In-mod ImGui API, let mods register their own overlay panels, notifications, etc. Currently being worked on but a bigger task than I thought...
+- ~~In-mod ImGui API, let mods register their own overlay panels, notifications, etc. Currently being worked on but a bigger task than I thought...~~ DONE DONE DONE DONE WE ARE SO BACK WE A-
 - Resource Browser expansion, resource loading to replace `.package` as a requirement entirely, as well as XML tweaking in-script/dynamically through MM
 - Proper getting-started guide + working examples beyond the demo scripts (and actual mods)
-- Add more helper functions, including native-side access stuff
+- Add more helper functions, including native-side access stuff potentially, or this could be a S3MM helper mod I guess
 - Rewrite the readme to be less bad
 
 ## License

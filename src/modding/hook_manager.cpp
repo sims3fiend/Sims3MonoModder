@@ -2735,13 +2735,13 @@ uint32_t __cdecl HookManager::NativeCallerMintOffset() {
     return (uint32_t)((uintptr_t)cf.frame->ip - (uintptr_t)rtm->code);
 }
 
-// AUTO-PREFIXED LOG - Walk frames to resolve calling mod's assembly name, skipping S3MM.Helper
-static std::string ResolveCallerAssemblyName() {
-    if (!Addresses::Profiler.g_thread_context_tls_index) return "Mod";
+// CALLER ASSEMBLY - Walk interp frames for the first assembly that isn't S3MM.Helper (the calling mod). Empty if none found
+std::string ResolveModAssemblyFromFrames() {
+    if (!Addresses::Profiler.g_thread_context_tls_index) return "";
 
     DWORD tlsIndex = *(DWORD*)Addresses::Profiler.g_thread_context_tls_index;
     void* ctx = TlsGetValue(tlsIndex);
-    if (!ctx) return "Mod";
+    if (!ctx) return "";
 
     ThreadContext* threadCtx = reinterpret_cast<ThreadContext*>(ctx);
     InterpFrame* frame = threadCtx->current_frame;
@@ -2766,6 +2766,13 @@ static std::string ResolveCallerAssemblyName() {
 
         return std::string(name);
     }
+    return "";
+}
+
+// AUTO-PREFIXED LOG - Calling mod's assembly name for log prefixes
+static std::string ResolveCallerAssemblyName() {
+    std::string name = ResolveModAssemblyFromFrames();
+    if (!name.empty()) return name;
 
     // Fallback: try chain stack (works when called from within a hook dispatch)
     if (!t_chainStack.empty()) {

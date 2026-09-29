@@ -58,6 +58,13 @@ public static class ExampleMod
     private static uint _originalSleepTicks;
     private static bool _didTweakSleepTicks;
 
+    // --- UI demo (S3MM.UI) state ---
+    private static S3MM.UI.Window _demoWindow;
+    private static string _demoText = ""; // InputText round-trip demo: committed text is echoed by a dynamic label
+    private static int _demoInt = 0; // SliderInt demo value; also gates the disabled scope below it
+    private static float _demoFloat = 0.25f; // SliderFloat demo value, mirrored by the progress bar
+    private static int _demoMode = 0; // RadioButton demo selection
+
     // --- Save persistence ([PersistableStatic]) ---
     // A static field with this attribute is written into the save game and restored on load.
     // Same mechanism and save format as script .package mods, so data survives a .package <-> loose DLL migration.
@@ -171,6 +178,216 @@ public static class ExampleMod
         else
             S3MM.Log.Error("Failed to register cheat examplemod");
 
+        // --- UI demo (S3MM.UI) ---
+        // retained-mode overlay window (visible while the S3MM overlay is up)
+        // Builder calls append widgets; Update() pushes state to the overlay. Dynamic widgets take a funnc getter re-evaluated on each Update()
+        // Event handlers fire on the SIM THREAD at the next tick, so touching game state in them is safe. Closed in OnUnload.
+        _demoWindow = S3MM.UI.CreateWindow("ExampleMod");
+        // Postfix modifiers bind to the widget just added: Style/Color on a Label, Hover/Tooltip on any item widget
+        // They compose, so there's no overload per combination
+        _demoWindow.Label("ExampleMod UI demo", S3MM.UI.TextStyle.Bullet).Color(255, 220, 120);
+        _demoWindow.Label(
+            delegate
+            {
+                return "CoinFlips observed: " + _coinFlipsObserved;
+            }
+        );
+        _demoWindow.Label(
+            delegate
+            {
+                return "GetInt hooks (P0):  " + _getIntsHooked;
+            }
+        );
+        _demoWindow.Separator();
+        _demoWindow
+            .Button(
+                "Send notification",
+                delegate
+                {
+                    S3MM.UI.Notify("ExampleMod says hi!", S3MM.UI.Severity.Info, 3000);
+                }
+            )
+            .Tooltip("Shows a toast, visible even with the overlay hidden")
+            .Hover(
+                delegate(bool entered)
+                {
+                    // Edge-triggered: one call on enter, one on leave - never per frame
+                    S3MM.Log.Debug("Notification button hover: " + entered);
+                }
+            );
+        _demoWindow.SameLine();
+        // Handlers may touch the window itself: re-serialize the dynamic labels on demand
+        _demoWindow.Button(
+            "Refresh now",
+            delegate
+            {
+                _demoWindow.Update();
+            }
+        );
+        // InputText round-trip: the getter feeds the field on each Update(), the commit handler (Enter / focus loss) stores the value, and the dynamic label below echoes it after the handler's Update()
+        _demoWindow.InputText(
+            "Display text",
+            delegate
+            {
+                return _demoText;
+            },
+            delegate(string v)
+            {
+                _demoText = v;
+                _demoWindow.Update(); // refresh the echo label right away instead of waiting for the periodic refresh
+            }
+        );
+        _demoWindow.Label(
+            delegate
+            {
+                return "You typed: " + (_demoText.Length == 0 ? "(nothing yet)" : _demoText);
+            }
+        );
+        // Sliders: the getter feeds the knob on each Update(), onChange fires on the sim thread when the knob is RELEASED (not per frame)
+        // funfact Ctrl+click the slider to type a value.
+        // Progress bar mirrors the float, disabled greys out its contents while the int slider sits at 0
+        _demoWindow.Separator("Sliders");
+        // ItemWidth applies to the NEXT widget only. Layout ops (ItemWidth, SameLine, Separator, Spacing, Indent/Unindent) emit no item, so modifiers still bind past them
+        _demoWindow.ItemWidth(150f);
+        _demoWindow.SliderInt(
+            "Count",
+            delegate
+            {
+                return _demoInt;
+            },
+            0,
+            100,
+            delegate(int v)
+            {
+                _demoInt = v;
+                _demoWindow.Update();
+            }
+        );
+        _demoWindow.SliderFloat(
+            "Fraction",
+            delegate
+            {
+                return _demoFloat;
+            },
+            0.0f,
+            1.0f,
+            "%.2f",
+            delegate(float v)
+            {
+                _demoFloat = v;
+                _demoWindow.Update();
+            }
+        );
+        _demoWindow.ProgressBar(
+            delegate
+            {
+                return _demoFloat;
+            }
+        );
+        _demoWindow.BeginDisabled(
+            delegate
+            {
+                return _demoInt == 0;
+            }
+        );
+        _demoWindow.Button(
+            "Log count",
+            delegate
+            {
+                S3MM.Log.Info("Demo count = " + _demoInt);
+            }
+        );
+        _demoWindow.SameLine();
+        _demoWindow.Label("(enabled once Count > 0)", S3MM.UI.TextStyle.Disabled);
+        _demoWindow.EndDisabled();
+        // A real game switch driven through the Cache API from a UI event
+        _demoWindow.Checkbox(
+            "Disable autonomy (selected sim)",
+            delegate
+            {
+                return _sDisableAutonomyField != IntPtr.Zero
+                    && S3MM.Cache.GetStaticFieldBool(
+                        _autonomyRestrictionsClass,
+                        _sDisableAutonomyField
+                    );
+            },
+            delegate(bool v)
+            {
+                if (_sDisableAutonomyField != IntPtr.Zero)
+                    S3MM.Cache.SetStaticFieldBool(
+                        _autonomyRestrictionsClass,
+                        _sDisableAutonomyField,
+                        v
+                    );
+            }
+        );
+        _demoWindow.Selectable(
+            "Clickable/selectable row (click logs)",
+            false,
+            delegate
+            {
+                S3MM.Log.Info("Demo clickable/selectable row clicked");
+            }
+        );
+        // Right-click menu on the previous item (the row above)
+        _demoWindow.BeginContextMenu();
+        _demoWindow.ContextMenuItem(
+            "Log from context menu",
+            delegate
+            {
+                S3MM.Log.Info("Demo context menu item clicked");
+            }
+        );
+        _demoWindow.EndContextMenu();
+        // Radio buttons group by convention: each onClick sets the shared selection, the active getters read it back
+        _demoWindow.RadioButton(
+            "Mode A",
+            delegate
+            {
+                return _demoMode == 0;
+            },
+            delegate
+            {
+                _demoMode = 0;
+                _demoWindow.Update();
+            }
+        );
+        _demoWindow.SameLine();
+        _demoWindow.RadioButton(
+            "Mode B",
+            delegate
+            {
+                return _demoMode == 1;
+            },
+            delegate
+            {
+                _demoMode = 1;
+                _demoWindow.Update();
+            }
+        );
+        // The X button hides, it doesn't destroy: the window keeps its widgets and handlers, and Show() brings it back
+        _demoWindow.OnHidden = delegate
+        {
+            S3MM.Log.Info("Demo window hidden via X");
+        };
+        // Fires when the window is shown again via the "UI" button on the S3MM mods panel (or Show())
+        _demoWindow.OnShown = delegate
+        {
+            S3MM.Log.Info("Demo window shown again");
+        };
+        // Terminal: Close() below, or a hot-reload force-close. The window cannot come back from this.
+        _demoWindow.OnClosed = delegate
+        {
+            S3MM.Log.Info("Demo window destroyed");
+        };
+        _demoWindow.Update();
+        // Toasts draw even with the overlay hidden, so this shows right after load
+        S3MM.UI.Notify(
+            "ExampleMod loaded! press HOME for the demo window :D",
+            S3MM.UI.Severity.Info,
+            5000
+        );
+
         // Dynamic hook registration (no attribute) - same effect as [S3MM.Hook] but resolved at runtime via reflection.
         // Useful when the target method is only known at load time (e.g. plugin discovery, conditional patches, etc.).
         try
@@ -272,6 +489,13 @@ public static class ExampleMod
     [S3MM.OnUnload]
     public static void OnUnload()
     {
+        // Close the demo window (S3MM force-closes leftovers as a backstop, but do it properly)
+        if (_demoWindow != null)
+        {
+            _demoWindow.Close();
+            _demoWindow = null;
+        }
+
         // Restore anything we changed BEFORE hooks are torn down/removed
         if (_didTweakSleepTicks && _kInactiveSleepTicksField != IntPtr.Zero)
         {
@@ -331,9 +555,14 @@ public static class ExampleMod
         // postfix: log occasionally.
         // Don't spam - this method is hot.
         if ((_getIntsHooked & 0xFF) == 0)
+        {
             S3MM.Log.Debug(
                 "GetInt(" + min + "," + max + ") -> " + result + " (call #" + _getIntsHooked + ")"
             );
+            // Refresh the demo window's dynamic labels on the same cadence (hooks run on the sim thread, so this is safe)
+            if (_demoWindow != null)
+                _demoWindow.Update();
+        }
 
         return result;
     }

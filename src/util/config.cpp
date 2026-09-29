@@ -74,6 +74,17 @@ void Config::Initialize() {
             m_persistAutoRegister = *v;
             LOG_INFO("[Config] PersistAutoRegister = " + std::string(m_persistAutoRegister ? "true" : "false"));
         }
+        if (auto v = tbl["StartupToast"].value<bool>()) {
+            m_startupToast = *v;
+            LOG_INFO("[Config] StartupToast = " + std::string(m_startupToast ? "true" : "false"));
+        }
+        if (auto v = tbl["ToastPosX"].value<double>()) { m_toastPosX = static_cast<float>(*v); }
+        if (auto v = tbl["ToastPosY"].value<double>()) { m_toastPosY = static_cast<float>(*v); }
+        if (auto v = tbl["ToastAlpha"].value<double>()) {
+            m_toastAlpha = static_cast<float>(*v);
+            if (m_toastAlpha < 0.1f) m_toastAlpha = 0.1f;
+            if (m_toastAlpha > 1.0f) m_toastAlpha = 1.0f;
+        }
     } catch (const toml::parse_error& err) { LOG_INFO("[Config] Could not parse config (" + std::string(err.what()) + "), using defaults"); }
 
     // Apply verbose flag to logger. Note: config loads after Logger::Initialize, so the earliest startup lines (address resolution, image hooks) already emitted at the build default
@@ -103,9 +114,31 @@ void Config::Save() {
     tbl.insert("Verbose", m_verbose);
     tbl.insert("LogHookInvocations", m_logHookInvocations);
     tbl.insert("PersistAutoRegister", m_persistAutoRegister);
+    tbl.insert("StartupToast", m_startupToast);
+    tbl.insert("ToastPosX", static_cast<double>(m_toastPosX));
+    tbl.insert("ToastPosY", static_cast<double>(m_toastPosY));
+    tbl.insert("ToastAlpha", static_cast<double>(m_toastAlpha));
     file << tbl;
 
     LOG_INFO("[Config] Saved successfully");
+}
+
+void Config::GetToastLayout(float& posX, float& posY, float& alpha) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    posX = m_toastPosX;
+    posY = m_toastPosY;
+    alpha = m_toastAlpha;
+}
+
+void Config::SetToastLayout(float posX, float posY, float alpha) {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (m_toastPosX == posX && m_toastPosY == posY && m_toastAlpha == alpha) return;
+        m_toastPosX = posX;
+        m_toastPosY = posY;
+        m_toastAlpha = alpha;
+    }
+    Save();
 }
 
 UINT Config::GetToggleKey() const {
@@ -173,6 +206,11 @@ void Config::SetVerbose(bool verbose) {
 bool Config::IsPersistAutoRegister() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_persistAutoRegister;
+}
+
+bool Config::IsStartupToast() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_startupToast;
 }
 
 bool Config::IsLogHookInvocations() const {

@@ -37,6 +37,13 @@ class Config {
     // Persist bridge (modding/persist_bridge.h): register [PersistableStatic] fields of S3MM-loaded mods (vanilla scan runs before mods load). Default true
     bool IsPersistAutoRegister() const;
 
+    // Mod UI toast area (ui/mod_ui.cpp): position as fractions of the display (negative = default, top-right), background alpha 0.1..1
+    void GetToastLayout(float& posX, float& posY, float& alpha) const;
+    void SetToastLayout(float posX, float posY, float alpha);
+
+    // "S3MM loaded" toast after mod processing (dllmain.cpp OnMonoRuntimeReady). Default true
+    bool IsStartupToast() const;
+
     // Key name helper for display
     static std::string GetKeyName(UINT vkCode);
 
@@ -60,6 +67,10 @@ class Config {
     bool m_verbose = false;                // Verbose (Debug-level) logging; off by default
     bool m_logHookInvocations = false;     // Per-invocation hook invocation logging; off by default
     bool m_persistAutoRegister = true;     // Late [PersistableStatic] registration for S3MM mods
+    bool m_startupToast = true;            // Show the "S3MM loaded" toast once mods are processed
+    float m_toastPosX = -1.0f;             // Toast area top-left, fraction of display width (-1 = default)
+    float m_toastPosY = -1.0f;             // Toast area top-left, fraction of display height (-1 = default)
+    float m_toastAlpha = 0.65f;            // Toast background alpha
     bool m_initialized = false;
 };
 

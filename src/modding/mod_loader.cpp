@@ -7,6 +7,7 @@
 #include "../core/vanilla_extractor.h"
 #include "../util/logger.h"
 #include "../core/exception_helper.h"
+#include "../ui/mod_ui.h"
 #include <fstream>
 #include <cstring>
 #include <cstdlib>
@@ -984,6 +985,9 @@ void ModLoader::FireOnUnloadCallbacks(const std::string& modName) {
     auto modIt = std::find_if(m_loadedMods.begin(), m_loadedMods.end(), [&modName](const LoadedMod& m) { return m.name == modName; });
 
     if (modIt == m_loadedMods.end()) return;
+
+    // Drop any UI windows the mod still has open
+    ModUIManager::Get().CloseWindowsForMod(modName);
 
     LoadedMod& mod = *modIt;
     if (mod.onUnloadMethods.empty()) return;

@@ -1,8 +1,10 @@
 using System;
 using System.Collections;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using System.Text;
 
 namespace S3MM
 {
@@ -12,7 +14,7 @@ namespace S3MM
     /// </summary>
     public static class Version
     {
-        public const int Api = 3;
+        public const int Api = 4;
     }
 
     /// <summary>Native bridge for S3MM hook system. These methods call into the native S3MM code.
@@ -1649,5 +1651,1477 @@ namespace S3MM
         /// <param name="modName">Logical mod name (assembly name), or null/empty for all mods.</param>
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern string[] GetRefusedHooks(string modName);
+    }
+
+    /// <summary>Parameterless callback (button clicks, selectable rows, window-closed).</summary>
+    public delegate void UIHandler();
+
+    /// <summary>Single-value callback (checkbox toggles, text commits).</summary>
+    public delegate void UIValueHandler<T>(T value);
+
+    /// <summary>Getter re-evaluated on each Window.Update() for dynamic widgets.</summary>
+    public delegate T UIGetter<T>();
+
+    /// <summary>Posted to the sim thread via Threading.Post.</summary>
+    public delegate void SimThreadAction();
+
+    /// <summary>
+    /// Mod-facing overlay UI: notifications + retained-mode windows rendered by S3MM's ImGui overlay.
+    /// Mods never touch ImGui directly, builder calls record a widget list, Update() serializes it to a
+    /// command buffer handed to native, and input events (clicks, text commits, toggles) come back on the sim thread at the next sim tick
+    /// Windows render only while the S3MM overlay is visible (HOME by default), Notify toasts always show regardless (obvi)
+    /// Extras attach to the widget you just added as postfix modifiers: Hover(), Style(), Color(), Tooltip(), BeginContextMenu()
+    /// so a widget needs no overload per combination.
+    /// Hide()/Show() take a window off screen and back; Close() destroys it. Hot-reload: Close() your windows in [OnUnload]
+    /// </summary>
+    /// <example>
+    /// var win = S3MM.UI.CreateWindow("My Mod");
+    /// win.Label(delegate { return "Sims: " + simCount; });
+    /// win.Button("Do thing", delegate { DoThing(); }).Tooltip("Does the thing");
+    /// win.Label("careful", S3MM.UI.TextStyle.Bullet | S3MM.UI.TextStyle.Wrapped).Color(255, 64, 64);
+    /// win.InputText("Name", delegate { return currentName; }, delegate(string v) { currentName = v; });
+    /// win.Update(); // call again whenever the data changes
+    /// </example>
+    public static class UI
+    {
+        // Protocol constants - must match src/ui/mod_ui.cpp
+        private const uint kMagic = 0x31553353; // "S3U1"
+        private const uint kStrNone = 0xFFFFFFFF;
+
+        private const uint OpLabel = 3;
+        private const uint OpButton = 4;
+        private const uint OpSeparator = 5;
+        private const uint OpSameLine = 6;
+        private const uint OpSelectable = 7;
+        private const uint OpInputText = 8;
+        private const uint OpCheckbox = 9;
+        private const uint OpSpacing = 10;
+        private const uint OpTooltip = 11;
+        private const uint OpContextMenuBegin = 12;
+        private const uint OpContextMenuItem = 13;
+        private const uint OpContextMenuEnd = 14;
+        private const uint OpSliderFloat = 15; // fA = min, fB = max, reserved = value bits, strB = format, flags bit0 = logarithmic
+        private const uint OpSliderInt = 16; // fA/fB slots = raw int32 min/max, reserved = int32 value, strB = format
+        private const uint OpProgressBar = 17; // fA = fraction, strA = overlay
+        private const uint OpRadioButton = 18; // flags bit0 = active
+        private const uint OpIndent = 19;
+        private const uint OpUnindent = 20;
+        private const uint OpItemWidth = 21; // fA = px
+        private const uint OpBeginDisabled = 22; // flags bit0 = disabled
+        private const uint OpEndDisabled = 23;
+
+        private const uint LabelFlagColored = 1u << 3; // OpLabel: reserved = RGBA8 (flag bits 0-2 = TextStyle)
+
+        // Shared by every item op: the mod attached a Hover() handler, so native should track hover for this widget.
+        // Widgets that never ask cost nothing - no events queued, no per-widget native state allocated.
+        private const uint WidgetFlagWantsHover = 1u << 16;
+
+        internal const uint EventClick = 1;
+        internal const uint EventTextCommit = 2;
+        internal const uint EventBoolToggle = 3;
+        internal const uint EventWindowHidden = 4; // user clicked the X: the native slot is kept, so the window can come back
+        internal const uint EventWindowShown = 5; // native re-showed a hidden window (mods panel "UI" button)
+        internal const uint EventHover = 6; // intPayload 1 = hover enter, 0 = leave (edge-triggered)
+        internal const uint EventValueChanged = 7; // intPayload = int value (SliderInt) or raw float bits (SliderFloat); fires on release/commit
+        internal const uint EventWindowDestroyed = 8; // native dropped the slot (hot-reload force-close): terminal
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void Notify(string text, int severity, int durationMs);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void SubmitWindow(ulong handle, string title, byte[] buffer);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void CloseWindow(ulong handle);
+
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void SetWindowOpen(ulong handle, bool open);
+
+        /// <summary>Toast severity, controls the text color.</summary>
+        public enum Severity
+        {
+            Info = 0,
+            Warning = 1,
+            Error = 2,
+        }
+
+        /// <summary>
+        /// Label rendering flags (Window.Label / Window.Style). Combinable - Bullet | Wrapped is a wrapped bullet line, and Color() composes with any of them.
+        /// Values match the native LabelStyle bits.
+        /// </summary>
+        [Flags]
+        public enum TextStyle
+        {
+            /// <summary>Plain text.</summary>
+            Normal = 0,
+
+            /// <summary>Greyed-out text.</summary>
+            Disabled = 1,
+
+            /// <summary>Wraps at the window's right edge instead of extending it.</summary>
+            Wrapped = 2,
+
+            /// <summary>Bullet point prefix.</summary>
+            Bullet = 4,
+        }
+
+        /// <summary>Show an info toast in the top-right corner for 4 seconds. Always visible, even with the overlay hidden. Callable from any thread.</summary>
+        public static void Notify(string text)
+        {
+            Notify(text, Severity.Info, 4000);
+        }
+
+        /// <summary>Show a toast in the top-right corner. Always visible, even with the overlay hidden. Callable from any thread.</summary>
+        public static void Notify(string text, Severity severity, int durationMs)
+        {
+            if (text == null)
+                text = "";
+            Notify(text, (int)severity, durationMs);
+        }
+
+        private static ulong sNextHandle = 1;
+        private static readonly object sHandleLock = new object();
+
+        /// <summary>
+        /// Create a window. It appears once you add widgets and call Update().
+        /// The returned object is yours to keep; it stays registered (and its handlers alive) until Close().
+        /// </summary>
+        public static Window CreateWindow(string title)
+        {
+            ulong handle;
+            lock (sHandleLock)
+            {
+                handle = sNextHandle++;
+            }
+            Window w = new Window(handle, string.IsNullOrEmpty(title) ? "Window" : title);
+            lock (UIInternal.Windows)
+            {
+                UIInternal.Windows[handle] = w;
+            }
+            return w;
+        }
+
+        /// <summary>
+        /// A retained-mode overlay window.
+        /// Builder calls append widgets in order (chainable)
+        /// Update() pushes the current widget state to the overlay,
+        /// use it whenever your data changes (for live data, once per sim tick from a game alarm/task).
+        /// Dynamic widgets take UIGetter delegates re-evaluated at each Update() the plain-value overloads capture the value at call time.
+        /// Event handlers fire on the sim thread.
+        /// Hover(), Style() and Color() modify the last item widget added; Tooltip() and BeginContextMenu() attach to
+        /// it as well. Layout ops (SameLine, Separator, Spacing, Indent, ItemWidth, Begin/EndDisabled) leave that
+        /// binding alone, so they can sit between a widget and its modifiers.
+        /// </summary>
+        public sealed class Window
+        {
+            private readonly ulong _handle;
+            private readonly string _title;
+            private readonly List<Widget> _widgets = new List<Widget>();
+            private uint _nextWidget = 1;
+            private Widget _lastItem; // last item-emitting widget: what the postfix modifiers (Hover/Style/Color) bind to
+            private bool _visible = true;
+            private bool _destroyed;
+
+            /// <summary>Fired when the user hides the window with its title-bar X. The window still exists; Show() brings it back. Runs on the sim thread.</summary>
+            public UIHandler OnHidden;
+
+            /// <summary>Fired when a hidden window is shown again - Show(), or the S3MM mods panel "UI" button. Runs on the sim thread.</summary>
+            public UIHandler OnShown;
+
+            /// <summary>Fired once when the window is destroyed: Close(), or a hot-reload force-close. Terminal - the window cannot come back. Runs on the sim thread.</summary>
+            public UIHandler OnClosed;
+
+            /// <summary>False while the window is hidden (title-bar X or Hide()). Unrelated to the overlay toggle: a window behind a hidden overlay is still visible.</summary>
+            public bool IsVisible
+            {
+                get { return _visible && !_destroyed; }
+            }
+
+            /// <summary>True once the window has been destroyed by Close() or a hot-reload force-close. Terminal: Show() will not revive it.</summary>
+            public bool IsClosed
+            {
+                get { return _destroyed; }
+            }
+
+            internal Window(ulong handle, string title)
+            {
+                _handle = handle;
+                _title = title;
+            }
+
+            /// <summary>Static text line (captured at call time).</summary>
+            public Window Label(string text)
+            {
+                string captured = text;
+                return Label(
+                    delegate
+                    {
+                        return captured;
+                    }
+                );
+            }
+
+            /// <summary>Dynamic text line, re-evaluated on each Update().</summary>
+            public Window Label(UIGetter<string> text)
+            {
+                return Label(text, TextStyle.Normal);
+            }
+
+            /// <summary>Styled text line; flags combine (Bullet | Wrapped). Captured at call time.</summary>
+            public Window Label(string text, TextStyle style)
+            {
+                string captured = text;
+                return Label(
+                    delegate
+                    {
+                        return captured;
+                    },
+                    style
+                );
+            }
+
+            /// <summary>Styled text line; flags combine (Bullet | Wrapped). Re-evaluated on each Update().</summary>
+            public Window Label(UIGetter<string> text, TextStyle style)
+            {
+                LabelWidget w = new LabelWidget();
+                w.Text = text;
+                w.Style = style;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>Horizontal progress bar at the standard item width (ItemWidth() applies); fraction is clamped to 0..1. Null overlay shows a percentage.</summary>
+            public Window ProgressBar(UIGetter<float> fraction, UIGetter<string> overlay)
+            {
+                ProgressBarWidget w = new ProgressBarWidget();
+                w.Fraction = fraction;
+                w.Overlay = overlay;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>Progress bar with a percentage overlay; fraction is re-evaluated on each Update().</summary>
+            public Window ProgressBar(UIGetter<float> fraction)
+            {
+                return ProgressBar(fraction, null);
+            }
+
+            /// <summary>
+            /// Float slider. value is re-evaluated on each Update(); onChange(newValue) fires on the sim thread when the knob is released
+            /// (or a Ctrl+click typed value is committed), not per frame. Ctrl+click for keyboard entry, clamped to min..max.
+            /// </summary>
+            public Window SliderFloat(
+                string label,
+                UIGetter<float> value,
+                float min,
+                float max,
+                UIValueHandler<float> onChange
+            )
+            {
+                return SliderFloat(label, value, min, max, null, onChange);
+            }
+
+            /// <summary>Float slider with a printf-style value format (e.g. "%.1f", "%.0f%%", "%.2f m"). See the other overload for semantics.</summary>
+            public Window SliderFloat(
+                string label,
+                UIGetter<float> value,
+                float min,
+                float max,
+                string format,
+                UIValueHandler<float> onChange
+            )
+            {
+                string captured = label;
+                SliderFloatWidget w = new SliderFloatWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.Value = value;
+                w.Min = min;
+                w.Max = max;
+                w.Format = format;
+                w.OnChange = onChange;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>
+            /// Integer slider. value is re-evaluated on each Update(); onChange(newValue) fires on the sim thread when the knob is released
+            /// (or a Ctrl+click typed value is committed), not per frame. Clamped to min..max.
+            /// </summary>
+            public Window SliderInt(
+                string label,
+                UIGetter<int> value,
+                int min,
+                int max,
+                UIValueHandler<int> onChange
+            )
+            {
+                return SliderInt(label, value, min, max, null, onChange);
+            }
+
+            /// <summary>Integer slider with a printf-style value format (e.g. "%d sims", "%03d"). See the other overload for semantics.</summary>
+            public Window SliderInt(
+                string label,
+                UIGetter<int> value,
+                int min,
+                int max,
+                string format,
+                UIValueHandler<int> onChange
+            )
+            {
+                string captured = label;
+                SliderIntWidget w = new SliderIntWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.Value = value;
+                w.Min = min;
+                w.Max = max;
+                w.Format = format;
+                w.OnChange = onChange;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>Radio button; active drives the filled dot (re-evaluated each Update()), onClick fires on the sim thread. Group them by having each onClick set the shared selection.</summary>
+            public Window RadioButton(string label, UIGetter<bool> active, UIHandler onClick)
+            {
+                string captured = label;
+                RadioButtonWidget w = new RadioButtonWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.Active = active;
+                w.OnClick = onClick;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>Radio button with a captured active state; onClick fires on the sim thread.</summary>
+            public Window RadioButton(string label, bool active, UIHandler onClick)
+            {
+                bool captured = active;
+                return RadioButton(
+                    label,
+                    delegate
+                    {
+                        return captured;
+                    },
+                    onClick
+                );
+            }
+
+            /// <summary>Indent the following widgets by one level (until Unindent()).</summary>
+            public Window Indent()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpIndent;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Undo one Indent().</summary>
+            public Window Unindent()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpUnindent;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Width in pixels for the NEXT widget only (sliders, text fields, progress bars). Values &lt;= 0 keep the ImGui default.</summary>
+            public Window ItemWidth(float pixels)
+            {
+                ItemWidthWidget w = new ItemWidthWidget();
+                w.Pixels = pixels;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Grey out and disable input for every widget until EndDisabled(); disabled is re-evaluated on each Update(). Nestable; S3MM balances a missing EndDisabled at the end of the window.</summary>
+            public Window BeginDisabled(UIGetter<bool> disabled)
+            {
+                DisabledWidget w = new DisabledWidget();
+                w.Disabled = disabled;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Grey out and disable input for every widget until EndDisabled() (captured at call time).</summary>
+            public Window BeginDisabled(bool disabled)
+            {
+                bool captured = disabled;
+                return BeginDisabled(
+                    delegate
+                    {
+                        return captured;
+                    }
+                );
+            }
+
+            /// <summary>End the scope opened by BeginDisabled().</summary>
+            public Window EndDisabled()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpEndDisabled;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Button; onClick fires on the sim thread.</summary>
+            public Window Button(string label, UIHandler onClick)
+            {
+                string captured = label;
+                ButtonWidget w = new ButtonWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.OnClick = onClick;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>Clickable row (e.g. list entries); selected drives the highlight, onClick fires on the sim thread.</summary>
+            public Window Selectable(string label, bool selected, UIHandler onClick)
+            {
+                bool captured = selected;
+                return Selectable(
+                    label,
+                    delegate
+                    {
+                        return captured;
+                    },
+                    onClick
+                );
+            }
+
+            /// <summary>Clickable row (e.g. list entries); selected is re-evaluated each Update(), onClick fires on the sim thread.</summary>
+            public Window Selectable(string label, UIGetter<bool> selected, UIHandler onClick)
+            {
+                string captured = label;
+                SelectableWidget w = new SelectableWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.Selected = selected;
+                w.OnClick = onClick;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>Toggle; onChange(newValue) fires on the sim thread.</summary>
+            public Window Checkbox(string label, bool value, UIValueHandler<bool> onChange)
+            {
+                bool captured = value;
+                return Checkbox(
+                    label,
+                    delegate
+                    {
+                        return captured;
+                    },
+                    onChange
+                );
+            }
+
+            /// <summary>Toggle; value is re-evaluated each Update(), onChange(newValue) fires on the sim thread.</summary>
+            public Window Checkbox(
+                string label,
+                UIGetter<bool> value,
+                UIValueHandler<bool> onChange
+            )
+            {
+                string captured = label;
+                CheckboxWidget w = new CheckboxWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.Value = value;
+                w.OnChange = onChange;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>Text field; onCommit(text) fires on the sim thread on Enter or when the field loses focus after an edit.</summary>
+            public Window InputText(string label, string value, UIValueHandler<string> onCommit)
+            {
+                string captured = value;
+                return InputText(
+                    label,
+                    delegate
+                    {
+                        return captured;
+                    },
+                    onCommit
+                );
+            }
+
+            /// <summary>Text field; value is re-evaluated each Update(), onCommit(text) fires on the sim thread on Enter or focus loss after an edit.</summary>
+            public Window InputText(
+                string label,
+                UIGetter<string> value,
+                UIValueHandler<string> onCommit
+            )
+            {
+                string captured = label;
+                InputTextWidget w = new InputTextWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.Value = value;
+                w.OnCommit = onCommit;
+                AddItemWidget(w);
+                return this;
+            }
+
+            /// <summary>
+            /// Attach a hover handler to the PREVIOUS item widget: onHover(true) on enter, onHover(false) on leave.
+            /// Edge-triggered (never per frame) and fires on the sim thread. Native only tracks hover for widgets that
+            /// asked for it, so widgets without a handler queue no events.
+            /// </summary>
+            public Window Hover(UIValueHandler<bool> onHover)
+            {
+                Widget target = LastItem();
+                if (target == null)
+                {
+                    WarnModifier("Hover", "a widget");
+                    return this;
+                }
+                target.OnHoverHandler = onHover;
+                return this;
+            }
+
+            /// <summary>Restyle the PREVIOUS Label; flags combine (Bullet | Wrapped). Ignored with a logged warning on any other widget.</summary>
+            public Window Style(TextStyle style)
+            {
+                LabelWidget label = LastItem() as LabelWidget;
+                if (label == null)
+                {
+                    WarnModifier("Style", "a Label");
+                    return this;
+                }
+                label.Style = style;
+                return this;
+            }
+
+            /// <summary>Colour the PREVIOUS Label (RGB 0-255); composes with Style(). Ignored with a logged warning on any other widget.</summary>
+            public Window Color(byte r, byte g, byte b)
+            {
+                LabelWidget label = LastItem() as LabelWidget;
+                if (label == null)
+                {
+                    WarnModifier("Color", "a Label");
+                    return this;
+                }
+                label.Colored = true;
+                label.Rgba = (uint)r | ((uint)g << 8) | ((uint)b << 16) | 0xFF000000u;
+                return this;
+            }
+
+            /// <summary>Tooltip shown while the mouse hovers the PREVIOUS widget (captured at call time).</summary>
+            public Window Tooltip(string text)
+            {
+                string captured = text;
+                return Tooltip(
+                    delegate
+                    {
+                        return captured;
+                    }
+                );
+            }
+
+            /// <summary>Tooltip shown while the mouse hovers the PREVIOUS widget, re-evaluated on each Update().</summary>
+            public Window Tooltip(UIGetter<string> text)
+            {
+                TooltipWidget w = new TooltipWidget();
+                w.Text = text;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Begin a right-click context menu attached to the PREVIOUS widget. Follow with ContextMenuItem(...) entries and EndContextMenu().</summary>
+            public Window BeginContextMenu()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpContextMenuBegin;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Context menu entry; onClick fires on the sim thread. Only valid between BeginContextMenu() and EndContextMenu().</summary>
+            public Window ContextMenuItem(string label, UIHandler onClick)
+            {
+                string captured = label;
+                ContextMenuItemWidget w = new ContextMenuItemWidget();
+                w.LabelText = delegate
+                {
+                    return captured;
+                };
+                w.OnClick = onClick;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>End the context menu started by BeginContextMenu().</summary>
+            public Window EndContextMenu()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpContextMenuEnd;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Horizontal separator line.</summary>
+            public Window Separator()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpSeparator;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Separator line with an inline section label (captured at call time).</summary>
+            public Window Separator(string label)
+            {
+                string captured = label;
+                SeparatorTextWidget w = new SeparatorTextWidget();
+                w.Text = delegate
+                {
+                    return captured;
+                };
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Next widget goes on the same line as the previous one.</summary>
+            public Window SameLine()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpSameLine;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Vertical spacing.</summary>
+            public Window Spacing()
+            {
+                LayoutWidget w = new LayoutWidget();
+                w.Op = OpSpacing;
+                AddWidget(w);
+                return this;
+            }
+
+            /// <summary>Remove all widgets (rebuild pattern: Clear(), re-add, Update()).</summary>
+            public Window Clear()
+            {
+                lock (_widgets)
+                {
+                    _widgets.Clear();
+                    _lastItem = null;
+                }
+                return this;
+            }
+
+            /// <summary>Serialize the current widget state and push it to the overlay. Call after changing widgets or data.</summary>
+            public void Update()
+            {
+                if (_destroyed || !_visible)
+                    return; // a hidden window renders nothing; Show() resubmits
+
+                byte[] buffer;
+                lock (_widgets)
+                {
+                    StringBlob blob = new StringBlob();
+                    MemoryStream opStream = new MemoryStream();
+                    BinaryWriter opWriter = new BinaryWriter(opStream);
+                    for (int i = 0; i < _widgets.Count; i++)
+                    {
+                        _widgets[i].Serialize(opWriter, blob);
+                    }
+                    byte[] opBytes = opStream.ToArray();
+                    byte[] blobBytes = blob.ToArray();
+
+                    MemoryStream ms = new MemoryStream(16 + opBytes.Length + blobBytes.Length);
+                    BinaryWriter w = new BinaryWriter(ms);
+                    w.Write(kMagic);
+                    w.Write(0u); // reserved; wire changes bump Version.Api instead
+                    w.Write((uint)_widgets.Count);
+                    w.Write((uint)blobBytes.Length);
+                    w.Write(opBytes);
+                    w.Write(blobBytes);
+                    buffer = ms.ToArray();
+                }
+
+                SubmitWindow(_handle, _title, buffer);
+            }
+
+            /// <summary>
+            /// Hide the window without destroying it - the same state the user's title-bar X produces.
+            /// Show() brings it back with its widgets and handlers intact. No-op if already hidden.
+            /// </summary>
+            public void Hide()
+            {
+                if (_destroyed || !_visible)
+                    return;
+                _visible = false;
+                lock (UIInternal.Windows)
+                {
+                    UIInternal.Windows.Remove(_handle);
+                    UIInternal.HiddenWindows[_handle] = this;
+                }
+                SetWindowOpen(_handle, false);
+            }
+
+            /// <summary>
+            /// Show a hidden window again and push current widget state. No-op if already visible.
+            /// A window destroyed by Close() (or a hot-reload force-close) cannot be revived - that warns and returns.
+            /// </summary>
+            public void Show()
+            {
+                if (_destroyed)
+                {
+                    Log.Warn("[UI] " + _title + ": Show() on a closed window - ignored");
+                    return;
+                }
+                if (_visible)
+                    return;
+                _visible = true;
+                lock (UIInternal.Windows)
+                {
+                    UIInternal.HiddenWindows.Remove(_handle);
+                    UIInternal.Windows[_handle] = this;
+                }
+                SetWindowOpen(_handle, true);
+                Update();
+            }
+
+            /// <summary>
+            /// Destroy the window and unregister it: terminal, and it drops the GC root on the window and its handlers.
+            /// Use Hide() to take it off screen and keep it. Call from [OnUnload] at the latest.
+            /// </summary>
+            public void Close()
+            {
+                if (_destroyed)
+                    return;
+                _destroyed = true;
+                _visible = false;
+                lock (UIInternal.Windows)
+                {
+                    UIInternal.Windows.Remove(_handle);
+                    UIInternal.HiddenWindows.Remove(_handle);
+                }
+                CloseWindow(_handle); // erases the native slot whether it was on screen or hidden
+            }
+
+            // Non-item ops: layout (SameLine/Separator/Spacing/Indent/ItemWidth/Begin-EndDisabled) and the attachment
+            // ops (Tooltip, context menus). These leave the modifier cursor alone, the same rule that lets Tooltip and
+            // SameLine coexist.
+            private void AddWidget(Widget w)
+            {
+                lock (_widgets)
+                {
+                    w.Handle = _nextWidget++;
+                    _widgets.Add(w);
+                }
+            }
+
+            // Item ops: anything that occupies a row and can be hovered. These also become the modifier cursor,
+            // so Hover()/Style()/Color() bind to the widget the mod just added.
+            private void AddItemWidget(Widget w)
+            {
+                lock (_widgets)
+                {
+                    w.Handle = _nextWidget++;
+                    _widgets.Add(w);
+                    _lastItem = w;
+                }
+            }
+
+            // The modifier cursor: the last item widget added, or null if the mod hasn't added one yet.
+            // Callers warn for themselves so a misuse logs one line, not two.
+            private Widget LastItem()
+            {
+                lock (_widgets)
+                {
+                    return _lastItem;
+                }
+            }
+
+            private void WarnModifier(string modifier, string expected)
+            {
+                Log.Warn(
+                    "[UI] "
+                        + _title
+                        + ": "
+                        + modifier
+                        + "() needs "
+                        + expected
+                        + " before it - ignored"
+                );
+            }
+
+            // Called from UIInternal on the sim thread; handler exceptions are logged, never propagated into the pump
+            internal void DispatchWidgetEvent(
+                uint widgetHandle,
+                uint eventType,
+                int intPayload,
+                string strPayload
+            )
+            {
+                Widget target = null;
+                lock (_widgets)
+                {
+                    for (int i = 0; i < _widgets.Count; i++)
+                    {
+                        if (_widgets[i].Handle == widgetHandle)
+                        {
+                            target = _widgets[i];
+                            break;
+                        }
+                    }
+                }
+                if (target == null)
+                    return;
+
+                try
+                {
+                    target.OnEvent(eventType, intPayload, strPayload);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("[UI] " + _title + ": widget event handler threw: " + ex);
+                }
+            }
+
+            // Native reports the user clicked the X. The native slot survives, so park the window as hidden:
+            // still rooted, still holding its widgets and handlers, ready for Show().
+            internal void HandleHiddenFromNative()
+            {
+                if (_destroyed || !_visible)
+                    return;
+                _visible = false;
+                lock (UIInternal.Windows)
+                {
+                    UIInternal.Windows.Remove(_handle);
+                    UIInternal.HiddenWindows[_handle] = this;
+                }
+                Invoke(OnHidden, "OnHidden");
+            }
+
+            // Native re-showed a hidden window (mods panel "UI" button): re-register, resubmit, notify
+            internal void HandleShownFromNative()
+            {
+                if (_destroyed || _visible)
+                    return;
+                _visible = true;
+                lock (UIInternal.Windows)
+                {
+                    UIInternal.HiddenWindows.Remove(_handle);
+                    UIInternal.Windows[_handle] = this;
+                }
+                Update(); // native still holds the last buffer; resubmit so dynamic widgets are fresh
+                Invoke(OnShown, "OnShown");
+            }
+
+            // Native dropped the slot (hot-reload force-close). Terminal, and the window must not stay rooted:
+            // its handler delegates point into an image that is going away.
+            internal void HandleDestroyedFromNative()
+            {
+                if (_destroyed)
+                    return;
+                _destroyed = true;
+                _visible = false;
+                lock (UIInternal.Windows)
+                {
+                    UIInternal.Windows.Remove(_handle);
+                    UIInternal.HiddenWindows.Remove(_handle);
+                }
+                Invoke(OnClosed, "OnClosed");
+            }
+
+            private void Invoke(UIHandler handler, string name)
+            {
+                if (handler == null)
+                    return;
+                try
+                {
+                    handler();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("[UI] " + _title + ": " + name + " handler threw: " + ex);
+                }
+            }
+
+            // Serialization helpers - layout must match OpRecord in src/ui/mod_ui.cpp (32 bytes per op)
+            private sealed class StringBlob
+            {
+                private readonly MemoryStream _ms = new MemoryStream();
+
+                public uint Add(string s)
+                {
+                    if (s == null)
+                        s = "";
+                    uint offset = (uint)_ms.Position;
+                    byte[] bytes = Encoding.UTF8.GetBytes(s);
+                    _ms.Write(bytes, 0, bytes.Length);
+                    _ms.WriteByte(0);
+                    return offset;
+                }
+
+                public byte[] ToArray()
+                {
+                    return _ms.ToArray();
+                }
+            }
+
+            private static void WriteOp(
+                BinaryWriter w,
+                uint op,
+                uint handle,
+                uint flags,
+                uint strA,
+                uint strB
+            )
+            {
+                WriteOp(w, op, handle, flags, strA, strB, 0u, 0u, 0u);
+            }
+
+            // Full record: the three trailing 4-byte slots (native fA, fB, reserved) as raw bits, so ints travel exactly and floats via FloatBits()
+            private static void WriteOp(
+                BinaryWriter w,
+                uint op,
+                uint handle,
+                uint flags,
+                uint strA,
+                uint strB,
+                uint slotA,
+                uint slotB,
+                uint slotC
+            )
+            {
+                w.Write(op);
+                w.Write(handle);
+                w.Write(flags);
+                w.Write(strA);
+                w.Write(strB);
+                w.Write(slotA);
+                w.Write(slotB);
+                w.Write(slotC);
+            }
+
+            private static uint FloatBits(float f)
+            {
+                return BitConverter.ToUInt32(BitConverter.GetBytes(f), 0);
+            }
+
+            private static float BitsToFloat(int bits)
+            {
+                return BitConverter.ToSingle(BitConverter.GetBytes(bits), 0);
+            }
+
+            private abstract class Widget
+            {
+                public uint Handle;
+                public UIValueHandler<bool> OnHoverHandler; // set by Window.Hover(); edge-triggered enter/leave
+                public abstract void Serialize(BinaryWriter w, StringBlob blob);
+
+                // Every item op ORs this into its flags, so native can skip hover tracking - and the per-widget
+                // state that tracking allocates - for widgets nobody attached a handler to
+                protected uint HoverFlag
+                {
+                    get { return OnHoverHandler != null ? WidgetFlagWantsHover : 0u; }
+                }
+
+                public virtual void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    if (eventType == EventHover && OnHoverHandler != null)
+                        OnHoverHandler(intPayload != 0);
+                }
+            }
+
+            private sealed class LabelWidget : Widget
+            {
+                public UIGetter<string> Text;
+                public TextStyle Style = TextStyle.Normal;
+                public bool Colored;
+                public uint Rgba;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    uint flags = (uint)Style | (Colored ? LabelFlagColored : 0u) | HoverFlag;
+                    WriteOp(
+                        w,
+                        OpLabel,
+                        Handle,
+                        flags,
+                        blob.Add(Text != null ? Text() : ""),
+                        kStrNone,
+                        0u,
+                        0u,
+                        Colored ? Rgba : 0u
+                    );
+                }
+            }
+
+            private sealed class SeparatorTextWidget : Widget
+            {
+                public UIGetter<string> Text;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    WriteOp(
+                        w,
+                        OpSeparator,
+                        Handle,
+                        0,
+                        blob.Add(Text != null ? Text() : ""),
+                        kStrNone
+                    );
+                }
+            }
+
+            private sealed class ProgressBarWidget : Widget
+            {
+                public UIGetter<float> Fraction;
+                public UIGetter<string> Overlay;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    float f = Fraction != null ? Fraction() : 0.0f;
+                    uint strA = kStrNone;
+                    if (Overlay != null)
+                    {
+                        string s = Overlay();
+                        if (s != null)
+                            strA = blob.Add(s);
+                    }
+                    WriteOp(
+                        w,
+                        OpProgressBar,
+                        Handle,
+                        HoverFlag,
+                        strA,
+                        kStrNone,
+                        FloatBits(f),
+                        0u,
+                        0u
+                    );
+                }
+            }
+
+            private sealed class SliderFloatWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIGetter<float> Value;
+                public float Min,
+                    Max;
+                public string Format; // null = native default
+                public UIValueHandler<float> OnChange;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    float v = Value != null ? Value() : Min;
+                    uint strB = Format != null ? blob.Add(Format) : kStrNone;
+                    WriteOp(
+                        w,
+                        OpSliderFloat,
+                        Handle,
+                        HoverFlag,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        strB,
+                        FloatBits(Min),
+                        FloatBits(Max),
+                        FloatBits(v)
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventValueChanged && OnChange != null)
+                        OnChange(BitsToFloat(intPayload));
+                }
+            }
+
+            private sealed class SliderIntWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIGetter<int> Value;
+                public int Min,
+                    Max;
+                public string Format; // null = native default
+                public UIValueHandler<int> OnChange;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    int v = Value != null ? Value() : Min;
+                    uint strB = Format != null ? blob.Add(Format) : kStrNone;
+                    WriteOp(
+                        w,
+                        OpSliderInt,
+                        Handle,
+                        HoverFlag,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        strB,
+                        unchecked((uint)Min),
+                        unchecked((uint)Max),
+                        unchecked((uint)v)
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventValueChanged && OnChange != null)
+                        OnChange(intPayload);
+                }
+            }
+
+            private sealed class RadioButtonWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIGetter<bool> Active;
+                public UIHandler OnClick;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    uint flags = ((Active != null && Active()) ? 1u : 0u) | HoverFlag;
+                    WriteOp(
+                        w,
+                        OpRadioButton,
+                        Handle,
+                        flags,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        kStrNone
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventClick && OnClick != null)
+                        OnClick();
+                }
+            }
+
+            private sealed class ItemWidthWidget : Widget
+            {
+                public float Pixels;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    WriteOp(
+                        w,
+                        OpItemWidth,
+                        Handle,
+                        0,
+                        kStrNone,
+                        kStrNone,
+                        FloatBits(Pixels),
+                        0u,
+                        0u
+                    );
+                }
+            }
+
+            private sealed class DisabledWidget : Widget
+            {
+                public UIGetter<bool> Disabled;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    uint flags = (Disabled != null && Disabled()) ? 1u : 0u;
+                    WriteOp(w, OpBeginDisabled, Handle, flags, kStrNone, kStrNone);
+                }
+            }
+
+            private sealed class ButtonWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIHandler OnClick;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    WriteOp(
+                        w,
+                        OpButton,
+                        Handle,
+                        HoverFlag,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        kStrNone
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventClick && OnClick != null)
+                        OnClick();
+                }
+            }
+
+            private sealed class SelectableWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIGetter<bool> Selected;
+                public UIHandler OnClick;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    uint flags = ((Selected != null && Selected()) ? 1u : 0u) | HoverFlag;
+                    WriteOp(
+                        w,
+                        OpSelectable,
+                        Handle,
+                        flags,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        kStrNone
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventClick && OnClick != null)
+                        OnClick();
+                }
+            }
+
+            private sealed class CheckboxWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIGetter<bool> Value;
+                public UIValueHandler<bool> OnChange;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    uint flags = ((Value != null && Value()) ? 1u : 0u) | HoverFlag;
+                    WriteOp(
+                        w,
+                        OpCheckbox,
+                        Handle,
+                        flags,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        kStrNone
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventBoolToggle && OnChange != null)
+                        OnChange(intPayload != 0);
+                }
+            }
+
+            private sealed class InputTextWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIGetter<string> Value;
+                public UIValueHandler<string> OnCommit;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    WriteOp(
+                        w,
+                        OpInputText,
+                        Handle,
+                        HoverFlag,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        blob.Add(Value != null ? Value() : "")
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventTextCommit && OnCommit != null)
+                        OnCommit(strPayload ?? "");
+                }
+            }
+
+            private sealed class TooltipWidget : Widget
+            {
+                public UIGetter<string> Text;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    WriteOp(
+                        w,
+                        OpTooltip,
+                        Handle,
+                        0,
+                        blob.Add(Text != null ? Text() : ""),
+                        kStrNone
+                    );
+                }
+            }
+
+            private sealed class ContextMenuItemWidget : Widget
+            {
+                public UIGetter<string> LabelText;
+                public UIHandler OnClick;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    WriteOp(
+                        w,
+                        OpContextMenuItem,
+                        Handle,
+                        0,
+                        blob.Add(LabelText != null ? LabelText() : ""),
+                        kStrNone
+                    );
+                }
+
+                public override void OnEvent(uint eventType, int intPayload, string strPayload)
+                {
+                    base.OnEvent(eventType, intPayload, strPayload);
+                    if (eventType == EventClick && OnClick != null)
+                        OnClick();
+                }
+            }
+
+            private sealed class LayoutWidget : Widget
+            {
+                public uint Op;
+
+                public override void Serialize(BinaryWriter w, StringBlob blob)
+                {
+                    WriteOp(w, Op, Handle, 0, kStrNone, kStrNone);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Cross-thread helpers. The interpreter is not reentrant across threads, so managed code that
+    /// touches game state must run on the sim thread.
+    /// </summary>
+    public static class Threading
+    {
+        [MethodImpl(MethodImplOptions.InternalCall)]
+        private static extern void WakeSimThread();
+
+        // List, not Queue<T>: on .NET 2.0 Queue<T>/Stack<T> live in System.dll, and the helper is
+        // compiled /nostdlib against the game's mscorlib only.
+        private static readonly List<SimThreadAction> sActions = new List<SimThreadAction>();
+
+        /// <summary>
+        /// Run an action on the sim thread at the next sim tick (fire-and-forget). Safe to call from any
+        /// thread. UI event handlers already run on the sim thread and don't need this.
+        /// </summary>
+        public static void Post(SimThreadAction action)
+        {
+            if (action == null)
+                return;
+            lock (sActions)
+            {
+                sActions.Add(action);
+            }
+            WakeSimThread();
+        }
+
+        // Called from UIInternal on the sim thread once per tick while actions are pending
+        internal static void DrainPostedActions()
+        {
+            for (; ; )
+            {
+                SimThreadAction action;
+                lock (sActions)
+                {
+                    if (sActions.Count == 0)
+                        return;
+                    action = sActions[0];
+                    sActions.RemoveAt(0);
+                }
+                try
+                {
+                    action();
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("[Threading] Posted action threw: " + ex);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Internal: native-to-managed UI plumbing. The native per-tick pump (src/ui/mod_ui.cpp) resolves
+    /// and invokes these on the sim thread. Never call from mod code.
+    /// </summary>
+    internal static class UIInternal
+    {
+        // Live window registry, also the GC root that keeps windows + handler delegates alive
+        internal static readonly Dictionary<ulong, UI.Window> Windows =
+            new Dictionary<ulong, UI.Window>();
+
+        // Hidden windows whose native slot still exists (Hide(), the title-bar X, or the mods panel). Guarded by the
+        // Windows lock. Destroyed windows are in NEITHER map: their delegates may point into an unloaded image.
+        internal static readonly Dictionary<ulong, UI.Window> HiddenWindows =
+            new Dictionary<ulong, UI.Window>();
+
+        // Single entry for all widget/window events (eventType matches UIEventType in mod_ui.cpp)
+        internal static void DispatchEvent(
+            ulong windowHandle,
+            uint widgetHandle,
+            uint eventType,
+            int intPayload,
+            string strPayload
+        )
+        {
+            if (eventType == UI.EventWindowShown)
+            {
+                UI.Window hidden;
+                lock (Windows)
+                {
+                    if (!HiddenWindows.TryGetValue(windowHandle, out hidden))
+                        return;
+                }
+                hidden.HandleShownFromNative();
+                return;
+            }
+
+            UI.Window window;
+            lock (Windows)
+            {
+                if (!Windows.TryGetValue(windowHandle, out window))
+                {
+                    // A hot-reload force-close sweeps hidden slots too, so that one event must also reach HiddenWindows
+                    if (eventType != UI.EventWindowDestroyed)
+                        return;
+                    if (!HiddenWindows.TryGetValue(windowHandle, out window))
+                        return;
+                }
+            }
+
+            if (eventType == UI.EventWindowHidden)
+            {
+                window.HandleHiddenFromNative();
+                return;
+            }
+
+            if (eventType == UI.EventWindowDestroyed)
+            {
+                window.HandleDestroyedFromNative();
+                return;
+            }
+
+            window.DispatchWidgetEvent(widgetHandle, eventType, intPayload, strPayload);
+        }
+
+        internal static void DrainPostedActions()
+        {
+            Threading.DrainPostedActions();
+        }
     }
 }

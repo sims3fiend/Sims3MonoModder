@@ -593,8 +593,22 @@ static int TransformWithSEH(void*(__cdecl* createRuntimeMethod)(void*), int(__cd
     DWORD tlsIndex = *(DWORD*)Addresses::Profiler.g_thread_context_tls_index;
     void* savedCtx = TlsGetValue(tlsIndex);
 
-    uint32_t frameRegion[10] = {0}; // zeroed frame the temp context's frame slots point at
-    void* tempCtx[5] = {threadCtxSeed, frameRegion, frameRegion, frameRegion, nullptr};
+    // The temp context must be a FULL ThreadContext (0x18: five pointers + search_for_handler @+0x14 / managed_code @+0x15), not just void*[5]
+    // Transform can run managed code (a .cctor on the first static access of a not-yet-initialized, e.g. a hot-reloaded image whose OnLoad hasn't run yet), ves_exec_method_with_context writes ctx->managed_code
+    // With a 0x14-byte buffer that byte lands on /GS cookie the compiler placed right after it -> STATUS_STACK_BUFFER_OVERRUN (fastfail 2) on return, no VEH log
+    struct alignas(8) TempFrame {
+        InterpFrame frame;
+        uint8_t slack[64];
+    } frameRegion = {};
+    struct alignas(8) TempCtx {
+        ThreadContext ctx;
+        uint8_t slack[64];
+    } tempCtxStorage = {};
+    tempCtxStorage.ctx.domain = threadCtxSeed;
+    tempCtxStorage.ctx.base_frame = &frameRegion.frame;
+    tempCtxStorage.ctx.current_frame = &frameRegion.frame;
+    tempCtxStorage.ctx.env_frame = &frameRegion.frame;
+    ThreadContext* tempCtx = &tempCtxStorage.ctx;
     bool installedTemp = (savedCtx == nullptr);
     if (installedTemp) { TlsSetValue(tlsIndex, tempCtx); }
 

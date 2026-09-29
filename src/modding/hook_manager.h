@@ -309,4 +309,7 @@ class HookManager {
     static uint64_t MakeHookTokenKey(void* image, uint32_t token) { return (static_cast<uint64_t>(reinterpret_cast<uintptr_t>(image)) << 32) | token; }
 };
 
+// CALLER ASSEMBLY - First interp frame whose assembly isn't S3MM.Helper, i.e. the mod calling into an icall. Empty if none found
+std::string ResolveModAssemblyFromFrames();
+
 } // namespace S3MM

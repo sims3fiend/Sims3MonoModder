@@ -1,4 +1,5 @@
 #include "imgui_manager.h"
+#include "mod_ui.h"
 #include "themes.h"
 #include "../util/logger.h"
 #include "../util/config.h"
@@ -225,7 +226,10 @@ void ImGuiManager::InitImGui(LPDIRECT3DDEVICE9 pDevice) {
 }
 
 void ImGuiManager::RenderFrame() {
-    if (!m_imguiInitialized || !m_visible) return;
+    if (!m_imguiInitialized) return;
+
+    // Toasts draw even with the overlay hidden, everything else wait for visibility
+    if (!m_visible && !ModUIManager::Get().HasToasts()) return;
 
     try {
         ImGui_ImplDX9_NewFrame();
@@ -233,7 +237,10 @@ void ImGuiManager::RenderFrame() {
         ImGui::NewFrame();
 
         // Call registered render callback
-        if (m_renderCallback) { m_renderCallback(); }
+        if (m_visible && m_renderCallback) { m_renderCallback(); }
+
+        // Mod UI: toasts always, mod windows only when the overlay is up (match input capture)
+        ModUIManager::Get().Render(m_visible);
 
         ImGui::EndFrame();
         ImGui::Render();

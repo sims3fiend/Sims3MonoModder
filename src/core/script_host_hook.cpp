@@ -2,6 +2,7 @@
 #include "addresses.h"
 #include "assembly_hooks.h"
 #include "mono_bridge.h"
+#include "../ui/mod_ui.h"
 #include "../util/logger.h"
 #include <Windows.h>
 #include <detours/detours.h>
@@ -38,6 +39,8 @@ static void __cdecl DetourStartupComplete() {
 static void __fastcall DetourProcessTasks(void* pHost) {
     s_originalProcessTasks(pHost);
     MonoBridge::Get().DrainSimTasks();
+    // Mod UI: dispatch queued input events + posted managed actions, on sim thread
+    ModUIManager::Get().PumpSimThread();
 }
 
 // SCRIPT_INITHEAP DETOUR - Intercepts heap initialization to detect Mono readiness
