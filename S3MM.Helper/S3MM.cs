@@ -11,10 +11,11 @@ namespace S3MM
     /// <summary>
     /// Current S3MM API version. Incremented only when the managed API shape changes (added/removed/renamed ICALLs, changed signatures, attribute semantics).
     /// Internal native changes that don't affect the managed surface do not bump this.
+    /// Don't forget to also bump ModCompiler::API_VERSION (src/modding/mod_compiler.h) :)
     /// </summary>
     public static class Version
     {
-        public const int Api = 4;
+        public const int Api = 5;
     }
 
     /// <summary>Native bridge for S3MM hook system. These methods call into the native S3MM code.
@@ -1132,7 +1133,7 @@ namespace S3MM
     ///
     /// IMPORTANT - your handler's return type IS the return ABI: there is no marshalling layer, whatever you return is written straight into the slot the game reads.
     /// Declare the target's EXACT return type - declaring 'object' on a target that returns an enum or struct hands the caller a boxed-object pointer where it expected the value, which usually shows up as a pointer-sized number (0x4xxxxxxx) rather than a crash. Reference-type returns (string, class) are unaffected.
-    /// A shape-mismatched ENTRY hook (the highest-priority hook on a target) is now refused at install time with an ERROR naming the mismatch - the target stays unhooked rather than corrupting its callers. Loosely-typed catch-all handlers remain legal at lower priority behind a shape-matched entry hook.
+    /// A shape-mismatched ENTRY hook (the first handler on a target: its highest-priority watcher if it has one, else its highest-priority hook) is now refused at install time with an ERROR naming the mismatch - the target stays unhooked rather than corrupting its callers. Loosely-typed catch-all handlers remain legal at lower priority behind a shape-matched entry hook.
     /// Value-type returns of ANY width are supported when declared exactly (the runtime pre-boxes the return; a 16-byte struct round-trips intact). Value types as PARAMETERS are fine at any size.
     /// </summary>
     /// <example>
@@ -1166,6 +1167,8 @@ namespace S3MM
         {
             get { return _signature; }
         }
+
+        /// <summary>Ordering among hooks on the same target (higher runs first). Watchers always precede hooks. Usage: [S3MM.Hook("...", Priority = 5)]</summary>
         public int Priority
         {
             get { return _priority; }
@@ -1484,14 +1487,15 @@ namespace S3MM
         /// <summary>Name of the mod that registered this hook.</summary>
         public string ModName;
 
-        /// <summary>Priority value (lower = runs first for hooks, watchers always run before hooks).</summary>
+        /// <summary>The Priority the mod declared on its [Hook]/[Watcher] (higher runs first). Watchers precede every hook regardless of this value, so compare priorities only among entries with the same <see cref="IsWatcher"/>.</summary>
         public int Priority;
 
         /// <summary>True if this is a read-only watcher, false if it's a hook.</summary>
         public bool IsWatcher;
 
         /// <summary>
-        /// True for the chain's entry hook - the method body callers actually dispatch into.
+        /// True for the chain's entry - the first handler in dispatch order, the method body callers actually dispatch into.
+        /// This is a watcher whenever the target has one (watchers run first).
         /// The entry can starve every lower-priority hook by returning without calling CallNext, so when a hook
         /// "isn't firing", check which mod holds the entry before suspecting the install.
         /// </summary>
@@ -1578,7 +1582,7 @@ namespace S3MM
         // T2: Bulk queries, native builds typed arrays directly, WIP may change
 
         /// <summary>
-        /// Returns all hook and watcher entries across all chains.
+        /// Returns all hook and watcher entries across all chains, one entry per handler, each chain in dispatch order (see <see cref="GetHookChain"/>).
         /// Returns null if no hooks are installed.
         /// </summary>
         /// <example>
@@ -1592,8 +1596,8 @@ namespace S3MM
         public static extern HookInfo[] GetAllHooks();
 
         /// <summary>
-        /// Returns the hook chain for a single method, in dispatch order (watchers first, then hooks by priority).
-        /// The first non-watcher entry is the chain entry point - its <see cref="HookInfo.IsEntry"/> is true.
+        /// Returns the hook chain for a single method, one entry per handler, in dispatch order (watchers by priority, then hooks by priority).
+        /// The first entry is the chain entry point - its <see cref="HookInfo.IsEntry"/> is true. If the target has a watcher, the entry is a watcher.
         /// Returns null if the method has no hooks.
         /// </summary>
         /// <param name="classMethod">Fully-qualified method in "Namespace.Class:Method" format.</param>
@@ -1601,13 +1605,13 @@ namespace S3MM
         /// HookInfo[] chain = S3MM.Audit.GetHookChain("Sims3.Gameplay.Actors.Sim:DoThing");
         /// // chain[0].Target     = "Sims3.Gameplay.Actors.Sim:DoThing"
         /// // chain[0].ModName    = "WatcherMod"
-        /// // chain[0].Priority   = 1000000
+        /// // chain[0].Priority   = 0      <- declared priority, not the internal watcher offset
         /// // chain[0].IsWatcher  = true
-        /// // chain[0].IsEntry    = false
+        /// // chain[0].IsEntry    = true   <- first handler in dispatch order holds the dispatch stub
         /// // chain[1].ModName    = "HookMod"
         /// // chain[1].Priority   = 0
         /// // chain[1].IsWatcher  = false
-        /// // chain[1].IsEntry    = true   <- first non-watcher entry holds the dispatch stub
+        /// // chain[1].IsEntry    = false
         /// </example>
         [MethodImpl(MethodImplOptions.InternalCall)]
         public static extern HookInfo[] GetHookChain(string classMethod);

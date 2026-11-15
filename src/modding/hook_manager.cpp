@@ -319,7 +319,7 @@ bool HookManager::RegisterHook(const std::string& targetClass, const std::string
         // This ensures watchers run before any other hooks.
         // Watchers should call CallNext to continue the chain - this way they observe the call even if later hooks don't call CallNext.
         HookEntry watcherAsHook = entry;
-        watcherAsHook.priority = 1000000 + priority; // Very high, but respect relative priority
+        watcherAsHook.priority = kWatcherPriorityBase + priority;
         chain.hooks.push_back(watcherAsHook);
         std::sort(chain.hooks.begin(), chain.hooks.end(), [](const HookEntry& a, const HookEntry& b) { return a.priority > b.priority; });
     }
@@ -447,7 +447,7 @@ bool HookManager::RegisterHookByPointer(void* targetMethod, void* hookMethod, Ho
     } else if (type == HookType::Watcher) {
         chain.watchers.push_back(entry);
         HookEntry watcherAsHook = entry;
-        watcherAsHook.priority = 1000000 + priority;
+        watcherAsHook.priority = kWatcherPriorityBase + priority;
         chain.hooks.push_back(watcherAsHook);
         std::sort(chain.hooks.begin(), chain.hooks.end(), [](const HookEntry& a, const HookEntry& b) { return a.priority > b.priority; });
     }

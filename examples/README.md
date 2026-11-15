@@ -103,9 +103,9 @@ See `HookVenueType` / `HookVenueIconKey` in ExampleMod; they hook the two method
 
 The rule applies to `[S3MM.Watcher]` methods unchanged. A watcher sits in the return path like any other hook, so "read-only" describes your intent, not an exemption from the return contract. Declare the target's exact return type and pass the value through untouched.
 
-### Eentry hooks can silently shadow every hook below them
+### Rentry hooks can silently shadow every hook below them
 
-A hook that returns **without calling `CallNext`** short-circuits the chain: no lower-priority hook and not even the original runs on that call. That is the point of skip-original, but it cuts both ways, if the short-circuiting hook isn't yours, YOUR hook "never fires" even though the install, the audit, and `IsMethodHooked` all say it's hooked.
+A hook that returns **without calling `CallNext`** short-circuits the chain: no lower-priority hook and not even the original runs on that call. That is the point of skip-original, but it cuts both ways, if the short-circuiting hook isn't yours, YOUR hook "never fires" even though the install, the audit, and `IsMethodHooked` all will say it's hooked.
 
 The dispatch order is watchers first, then hooks by priority, and the first non-watcher hook is the **entry** (its body is what callers dispatch into). Hooks at EQUAL priority keep registration order, which is mod load order, so two mods doing the same trick on the same target collide with no warning.
 
@@ -113,8 +113,7 @@ When a hook isn't firing, dump the chain before suspecting the install:
 
 ```csharp
 S3MM.HookInfo[] chain = S3MM.Audit.GetHookChain("Some.Class:Method");
-// The first non-watcher entry has IsEntry == true - if that's another mod
-// and it short-circuits, your hook is starved, not broken.
+// One entry per handler, in dispatch order. chain[0] has IsEntry == true (a watcher if the target has one) if that's another mod and it short-circuits, then your hook is starved, not broken.
 ```
 
 If you short-circuit deliberately, either pick a priority that makes the shadowing intentional, or gate it so normal chains pass through. I may add additional logging/stuff for this in the future.

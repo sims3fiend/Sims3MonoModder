@@ -139,6 +139,16 @@ void AuditAPI::WriteHookInfo(void* array, int32_t index, void* targetStr, const 
     *(uint8_t*)(elem + s_hiIsEntryOff) = isEntry ? 1 : 0;
 }
 
+// WRITE CHAIN ENTRIES - One HookInfo per handler, in dispatch order (chain.hooks already holds the watchers, chain.watchers is only a bookkeeping copy)
+// Reports DECLARED priority
+void AuditAPI::WriteChainEntries(void* array, int32_t& idx, void* targetStr, const HookChain& chain) {
+    for (const auto& h : chain.hooks) {
+        bool isWatcher = h.type == HookType::Watcher;
+        int32_t priority = isWatcher ? h.priority - kWatcherPriorityBase : h.priority;
+        WriteHookInfo(array, idx++, targetStr, h.modName.c_str(), priority, isWatcher, &h == &chain.hooks.front());
+    }
+}
+
 // INDEX MANAGEMENT - Rebuild class:method lookup index
 void AuditAPI::RebuildClassMethodIndex() {
     const auto& chains = HookManager::Get().GetAllChains();
@@ -227,7 +237,7 @@ void* __cdecl AuditAPI::NativeGetAllHooks() {
 
     // Count total entries
     int32_t totalEntries = 0;
-    for (const auto& [methodPtr, chain] : chains) { totalEntries += static_cast<int32_t>(chain.watchers.size() + chain.hooks.size()); }
+    for (const auto& [methodPtr, chain] : chains) { totalEntries += static_cast<int32_t>(chain.hooks.size()); }
     if (totalEntries == 0) return nullptr;
 
     // Create HookInfo[] value type array
@@ -243,8 +253,7 @@ void* __cdecl AuditAPI::NativeGetAllHooks() {
         std::string target = chain.targetClass + ":" + chain.targetMethod;
         void* targetStr = bridge.CreateString(target.c_str());
 
-        for (const auto& w : chain.watchers) { WriteHookInfo(array, idx++, targetStr, w.modName.c_str(), w.priority, true, false); }
-        for (const auto& h : chain.hooks) { WriteHookInfo(array, idx++, targetStr, h.modName.c_str(), h.priority, false, &h == &chain.hooks.front()); }
+        WriteChainEntries(array, idx, targetStr, chain);
     }
 
     return array;
@@ -268,7 +277,7 @@ void* __cdecl AuditAPI::NativeGetHookChain(void* classMethodStr) {
     HookChain* chain = HookManager::Get().GetChainByName(targetClass, targetMethod);
     if (!chain) return nullptr;
 
-    int32_t totalEntries = static_cast<int32_t>(chain->watchers.size() + chain->hooks.size());
+    int32_t totalEntries = static_cast<int32_t>(chain->hooks.size());
     if (totalEntries == 0) return nullptr;
 
     void* array = bridge.CreateArray(s_hookInfoKlass, totalEntries);
@@ -277,8 +286,7 @@ void* __cdecl AuditAPI::NativeGetHookChain(void* classMethodStr) {
     void* targetStr = bridge.CreateString(classMethod.c_str());
 
     int32_t idx = 0;
-    for (const auto& w : chain->watchers) { WriteHookInfo(array, idx++, targetStr, w.modName.c_str(), w.priority, true, false); }
-    for (const auto& h : chain->hooks) { WriteHookInfo(array, idx++, targetStr, h.modName.c_str(), h.priority, false, &h == &chain->hooks.front()); }
+    WriteChainEntries(array, idx, targetStr, *chain);
 
     return array;
 }

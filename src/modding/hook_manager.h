@@ -14,6 +14,9 @@ enum class HookType {
     Watcher // Read-only observer - should always call CallNext()
 };
 
+// Watchers HookChain::hooks at this base + their declared priority so they always sort ahead of hooks
+constexpr int kWatcherPriorityBase = 1000000;
+
 // HOOK ENTRY - A single hook registered by a mod
 struct HookEntry {
     std::string modName;        // Which mod registered this hook
@@ -43,8 +46,8 @@ struct HookChain {
     std::string targetMethod; // e.g., "DoThing"
     std::string signature;    // e.g., "(int,int)" for overload matching
 
-    std::vector<HookEntry> hooks;    // Sorted by priority (high to low)
-    std::vector<HookEntry> watchers; // Read-only observers (very high priority)
+    std::vector<HookEntry> hooks;    // Dispatch order, sorted by priority (high to low)
+    std::vector<HookEntry> watchers; // Copy of the watchers for bookkeeping stuff (declared priority) NOT a separate dispatch list
 
     bool isPatched = false;       // Has the dispatch stub been installed?
     bool needsReinstall = false;  // Does the dispatch stub need updating? (after hot-reload)

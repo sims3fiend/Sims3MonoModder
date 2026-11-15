@@ -19,8 +19,8 @@ struct ModInfo {
 // MOD COMPILER - Discovers mods and optionally compiles C# sources using the highest available .NET Framework csc.exe
 class ModCompiler {
   public:
-    // Bump ONLY when managed API shape changes (added/removed/renamed ICALLs, changed signatures, attribute semantics)
-    static constexpr int API_VERSION = 3;
+    // Don't forget to bump S3MM.Version.Api (S3MM.Helper/S3MM.cs) :)
+    static constexpr int API_VERSION = 5;
 
     static ModCompiler& Get();
 

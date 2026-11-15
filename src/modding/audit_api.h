@@ -5,6 +5,8 @@
 
 namespace S3MM {
 
+struct HookChain;
+
 // AUDIT API - Read-only introspection of hook chains, assembly conflicts, and loaded mods. Consumers: error trap mods (stack trace scanning), diagnostic tools.
 // Thread safety: ICALLs run on game thread. HookManager modified only during ProcessMods. ConflictDetector uses its own mutexes. Tier 2 methods return managed arrays natively.
 class AuditAPI {
@@ -75,6 +77,9 @@ class AuditAPI {
 
     // Helper: write a HookInfo element into array at index
     static void WriteHookInfo(void* array, int32_t index, void* targetStr, const char* modName, int32_t priority, bool isWatcher, bool isEntry);
+
+    // Helper: write one HookInfo per handler of chain (dispatch order, declared priority), advancing idx
+    static void WriteChainEntries(void* array, int32_t& idx, void* targetStr, const HookChain& chain);
 };
 
 } // namespace S3MM

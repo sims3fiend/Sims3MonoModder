@@ -943,7 +943,7 @@ public static class ExampleMod
         S3MM.HookInfo[] chain = S3MM.Audit.GetHookChain("Sims3.Gameplay.Core.RandomUtil:GetInt");
         if (chain != null)
         {
-            S3MM.Log.Info("-- Chain on RandomUtil:GetInt (highest priority first) --");
+            S3MM.Log.Info("-- Chain on RandomUtil:GetInt (dispatch order) --");
             for (int i = 0; i < chain.Length; i++)
             {
                 S3MM.Log.Info(
